@@ -14,7 +14,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-import win32gui
 from tkinter import ttk
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +42,8 @@ if missing:
 # pywin32 is optional — needed for window title scanning
 try:
     import win32gui
+    import win32process
+    import psutil
     HAS_WIN32 = True
 except ImportError:
     HAS_WIN32 = False
@@ -71,51 +72,160 @@ AMBER   = "#854F0B"
 
 # ── Now Playing detection ─────────────────────────────────────────────────────
 
-NOW_PLAYING_PATTERNS = [
-    # Spotify desktop: "Song Title - Artist Name"
-    ("Spotify",      re.compile(r"^(.+?)\s*[–\-]\s*(.+?)\s*$")),
-    # YouTube in browser: "Song Title - YouTube"
-    ("YouTube",      re.compile(r"^(.+?)\s*-\s*YouTube$")),
-    # SoundCloud: "Song Title by Artist on SoundCloud"
-    ("SoundCloud",   re.compile(r"^(.+?)\s+by\s+(.+?)\s+on SoundCloud")),
-    # Tidal: "Song - Artist | TIDAL"
-    ("Tidal",        re.compile(r"^(.+?)\s*[–\-]\s*(.+?)\s*\|\s*TIDAL")),
-    # Apple Music (web): "Song - Artist - Apple Music"
-    ("Apple Music",  re.compile(r"^(.+?)\s*-\s*(.+?)\s*-\s*Apple Music")),
-    # Amazon Music: "Song by Artist on Amazon Music"
-    ("Amazon Music", re.compile(r"^(.+?)\s+by\s+(.+?)\s+(?:on )?Amazon Music")),
-    # Deezer: "Song by Artist - Deezer"
-    ("Deezer",       re.compile(r"^(.+?)\s+by\s+(.+?)\s*-\s*Deezer")),
-]
+# YouTube title formats vary by browser and whether playing:
+#   Chrome/Edge:  "Song - Artist - YouTube"  or  "▶ Song - Artist - YouTube"
+#   Firefox:      "Song - Artist — YouTube"
+#   Some videos:  "Song - YouTube"  (no artist in title)
+# SoundCloud:     "Song - Artist on SoundCloud"  or  "Song by Artist on SoundCloud"
+# Tidal:          "Song - Artist | TIDAL"
+# Apple Music:    "Song - Artist - Apple Music"
+# Amazon Music:   "Song by Artist - Amazon Music"
+# Deezer:         "Song - Artist - Deezer"  or  "Song by Artist - Deezer"
+# Spotify:        "Song - Artist"  (bare, no suffix — checked last to avoid false positives)
+
+_YT = re.compile(
+    r"^[▶►\s]*"                       # optional playing indicator
+    r"(?:\(\d+\)\s*)?"             # optional notification count e.g. "(3) "
+    r"(.+?)"                           # song (and maybe artist)
+    r"(?:\s*[-–]\s*(.+?))?"     # optional " - Artist" portion
+    r"\s*[-–—]\s*YouTube"  # "- YouTube" marker
+    r"(?:\s*[-–—]\s*.+?)?$",  # optional browser suffix: "- Opera", "- Chrome"
+    re.IGNORECASE,
+)
+_SC = re.compile(
+    r"^(.+?)\s+(?:by|[-–])\s+(.+?)\s+on SoundCloud",
+    re.IGNORECASE,
+)
+_TIDAL = re.compile(r"^(.+?)\s*[-–]\s*(.+?)\s*\|\s*TIDAL", re.IGNORECASE)
+_AM    = re.compile(r"^(.+?)\s*[-–]\s*(.+?)\s*[-–]\s*Apple Music$", re.IGNORECASE)
+_AMZ   = re.compile(r"^(.+?)\s+by\s+(.+?)\s*(?:[-–]|on)\s*Amazon Music", re.IGNORECASE)
+_DEZ   = re.compile(r"^(.+?)\s*(?:by\s+(.+?)\s*[-–]|[-–]\s*(.+?))\s*[-–]\s*Deezer$", re.IGNORECASE)
+_SPOT  = re.compile(
+    r"^(?!.*(?:Visual Studio|Code|Chrome|Firefox|Edge|Opera|Brave|Explorer|"
+    r"Notepad|Word|Excel|PowerPoint|Outlook|Teams|Slack|Discord|Steam|cmd|"
+    r"PowerShell|Task Manager|Settings|Control Panel|File Explorer|"
+    r"\.[a-z]{2,4}\s*[-–]))(.+?)\s*[-–]\s*(.+?)$"
+)
+
+
+def _parse_youtube(title):
+    m = _YT.match(title)
+    if not m:
+        return None
+    part1 = m.group(1).strip()
+    part2 = (m.group(2) or "").strip()
+    # If we have two parts, part1=song, part2=artist
+    # If only one part, the whole thing is the video title (song only)
+    return {"source": "YouTube", "song": part1, "artist": part2, "raw": title}
+
+
+def _parse_generic(source, m, title):
+    if not m:
+        return None
+    groups = [g.strip() for g in m.groups() if g]
+    song   = groups[0] if groups else ""
+    artist = groups[1] if len(groups) > 1 else ""
+    if len(song) < 2:
+        return None
+    return {"source": source, "song": song, "artist": artist, "raw": title}
+
+
+NOW_PLAYING_PATTERNS = []  # not used directly anymore
 
 SKIP_TITLES = {"", "Program Manager", "Windows Default Lock Screen"}
 
 
+def get_process_name(hwnd):
+    """Return the exe name (lowercase) for a given window handle."""
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        proc = psutil.Process(pid)
+        return proc.name().lower()
+    except Exception:
+        return ""
+
+
 def get_all_window_titles():
+    """Return list of (title, process_name) for all visible windows."""
     if not HAS_WIN32:
         return []
-    titles = []
+    results = []
     def callback(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
             t = win32gui.GetWindowText(hwnd).strip()
             if t and t not in SKIP_TITLES:
-                titles.append(t)
+                proc = get_process_name(hwnd)
+                results.append((t, proc))
     win32gui.EnumWindows(callback, None)
-    return titles
+    return results
+
+
+# Browser process names for YouTube/SoundCloud/web players
+BROWSER_PROCS = {
+    "chrome.exe", "msedge.exe", "firefox.exe",
+    "opera.exe", "opera_gx.exe", "opera_autoupdate.exe",  # Opera & Opera GX
+    "brave.exe", "vivaldi.exe", "iexplore.exe", "chromium.exe",
+    "waterfox.exe", "librewolf.exe", "palemoon.exe", "basilisk.exe",
+    "thorium.exe", "arc.exe",
+}
+
+# Partial process name matches (substring) for browsers that use generic names
+BROWSER_PROC_SUBSTRINGS = ("opera", "browser", "chrom", "firefox", "brave", "vivaldi")
+# Spotify process names
+SPOTIFY_PROCS = {"spotify.exe"}
 
 
 def detect_now_playing():
-    titles = get_all_window_titles()
-    for title in titles:
-        for source, pattern in NOW_PLAYING_PATTERNS:
-            m = pattern.match(title)
-            if m:
-                groups = m.groups()
-                song   = groups[0].strip()
-                artist = groups[1].strip() if len(groups) > 1 else ""
-                if len(song) < 2:
-                    continue
-                return {"source": source, "song": song, "artist": artist, "raw": title}
+    windows = get_all_window_titles()
+    for title, proc in windows:
+        is_browser = (proc in BROWSER_PROCS or
+                      any(s in proc for s in BROWSER_PROC_SUBSTRINGS))
+        is_spotify = proc in SPOTIFY_PROCS
+
+        # YouTube — must be a browser
+        if is_browser:
+            result = _parse_youtube(title)
+            if result:
+                return result
+
+        # SoundCloud — must be a browser
+        if is_browser:
+            result = _parse_generic("SoundCloud", _SC.match(title), title)
+            if result:
+                return result
+
+        # Tidal — browser or desktop app
+        result = _parse_generic("Tidal", _TIDAL.match(title), title)
+        if result:
+            return result
+
+        # Apple Music — browser
+        if is_browser:
+            result = _parse_generic("Apple Music", _AM.match(title), title)
+            if result:
+                return result
+
+        # Amazon Music — browser
+        if is_browser:
+            result = _parse_generic("Amazon Music", _AMZ.match(title), title)
+            if result:
+                return result
+
+        # Deezer — browser
+        if is_browser:
+            dm = _DEZ.match(title)
+            if dm:
+                song   = (dm.group(1) or "").strip()
+                artist = (dm.group(2) or dm.group(3) or "").strip()
+                if len(song) >= 2:
+                    return {"source": "Deezer", "song": song, "artist": artist, "raw": title}
+
+        # Spotify — ONLY match if the process is actually spotify.exe
+        if is_spotify:
+            result = _parse_generic("Spotify", _SPOT.match(title), title)
+            if result:
+                return result
+
     return None
 
 # ── Data layer ────────────────────────────────────────────────────────────────
@@ -293,11 +403,24 @@ class SoniqueApp:
                 s = json.loads(SETTINGS_FILE.read_text())
                 if s.get("api_key"):
                     self.api_key = s["api_key"]
+                if s.get("extra_browsers"):
+                    for b in s["extra_browsers"]:
+                        BROWSER_PROCS.add(b.lower().strip())
             except Exception:
                 pass
 
-    def _save_settings(self):
-        SETTINGS_FILE.write_text(json.dumps({"api_key": self.api_key}))
+    def _save_settings(self, extra_browsers=None):
+        data = {"api_key": self.api_key}
+        if extra_browsers is not None:
+            data["extra_browsers"] = extra_browsers
+        elif SETTINGS_FILE.exists():
+            try:
+                prev = json.loads(SETTINGS_FILE.read_text())
+                if prev.get("extra_browsers"):
+                    data["extra_browsers"] = prev["extra_browsers"]
+            except Exception:
+                pass
+        SETTINGS_FILE.write_text(json.dumps(data))
 
     # ── Tray ──────────────────────────────────────────────────────────────────
 
@@ -377,6 +500,11 @@ class SoniqueApp:
                  bg=ACCENT, fg="white").pack(side="left", padx=18, pady=10)
         tk.Label(hdr, text="AI Music Taste Engine", font=("Segoe UI", 10),
                  bg=ACCENT, fg="#A8E8D0").pack(side="left", pady=14)
+        tk.Button(hdr, text="Exit", font=("Segoe UI", 10),
+                  bg=DARK, fg="white", relief="flat",
+                  padx=14, pady=6, cursor="hand2",
+                  activebackground="#0A3D2E", activeforeground="white",
+                  command=self._quit).pack(side="right", padx=14, pady=10)
 
         tab_frame = tk.Frame(root, bg=BG)
         tab_frame.pack(fill="x")
@@ -455,7 +583,7 @@ class SoniqueApp:
 
         if not HAS_WIN32:
             tk.Label(det_card,
-                     text="Auto-detection needs pywin32:  py -m pip install pywin32",
+                     text="Auto-detection needs pywin32 + psutil:  py -m pip install pywin32 psutil",
                      font=("Segoe UI", 9), bg=SURFACE, fg=AMBER,
                      anchor="w").pack(fill="x", padx=14, pady=(0, 8))
 
@@ -799,6 +927,44 @@ class SoniqueApp:
 
     # ── Settings tab ──────────────────────────────────────────────────────────
 
+    def _debug_processes(self):
+        """Print all visible window titles and their process names to help diagnose detection."""
+        try:
+            import win32gui, win32process, psutil
+            results = []
+            def cb(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd):
+                    t = win32gui.GetWindowText(hwnd).strip()
+                    if t:
+                        try:
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                            proc = psutil.Process(pid).name().lower()
+                        except Exception:
+                            proc = "unknown"
+                        results.append((proc, t))
+            win32gui.EnumWindows(cb, None)
+            lines = [f"{p:<30} {t}" for p, t in sorted(results)]
+            msg = "\n".join(lines[:40])
+        except Exception as e:
+            msg = str(e)
+
+        win = tk.Toplevel()
+        win.title("Process Debug")
+        win.geometry("700x420")
+        win.configure(bg=BG)
+        tk.Label(win, text="Visible windows and their process names",
+                 font=("Segoe UI", 10, "bold"), bg=BG, fg=TEXT).pack(anchor="w", padx=14, pady=(12,4))
+        tk.Label(win, text="Find your Opera/browser row and tell Sonique its process name.",
+                 font=("Segoe UI", 9), bg=BG, fg=MUTED).pack(anchor="w", padx=14, pady=(0,8))
+        txt = tk.Text(win, font=("Courier New", 9), bg=SURFACE, fg=TEXT,
+                      relief="flat", wrap="none")
+        sb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True, padx=(14,0), pady=(0,14))
+        sb.pack(side="right", fill="y", pady=(0,14), padx=(0,14))
+        txt.insert("end", msg)
+        txt.configure(state="disabled")
+
     def _build_settings(self, parent):
         f = tk.Frame(parent, bg=BG)
 
@@ -846,7 +1012,7 @@ class SoniqueApp:
                  wraplength=580, justify="left").pack(anchor="w", pady=(2, 10))
 
         win32_ok = "pywin32 installed — auto-detection active" if HAS_WIN32 \
-            else "pywin32 not found — run:  py -m pip install pywin32"
+            else "pywin32/psutil not found — run:  py -m pip install pywin32 psutil"
         tk.Label(f, text=win32_ok, font=("Segoe UI", 10),
                  bg=BG, fg=ACCENT if HAS_WIN32 else AMBER).pack(anchor="w", pady=(0, 14))
 
@@ -854,6 +1020,52 @@ class SoniqueApp:
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w")
         tk.Label(f, text=f"History file:  {DATA_FILE}",
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w", pady=(4, 0))
+
+        tk.Frame(f, bg=BORDER, height=1).pack(fill="x", pady=16)
+        tk.Label(f, text="Detection not working?",
+                 font=("Segoe UI", 10, "bold"), bg=BG, fg=TEXT).pack(anchor="w")
+        tk.Label(f, text="Add your browser's process name (e.g. opera.exe) — find it using the debug button below.",
+                 font=("Segoe UI", 9), bg=BG, fg=MUTED, wraplength=560, justify="left").pack(anchor="w", pady=(2, 6))
+
+        extra_row = tk.Frame(f, bg=BG)
+        extra_row.pack(fill="x", pady=(0, 8))
+        extra_var = tk.StringVar()
+        # Pre-fill with existing custom browsers from settings
+        try:
+            s = json.loads(SETTINGS_FILE.read_text()) if SETTINGS_FILE.exists() else {}
+            extra_var.set(", ".join(s.get("extra_browsers", [])))
+        except Exception:
+            pass
+        tk.Label(extra_row, text="Extra browsers:", font=("Segoe UI", 9),
+                 bg=BG, fg=MUTED).pack(side="left")
+        tk.Entry(extra_row, textvariable=extra_var, font=("Segoe UI", 10),
+                 bg=SURFACE, fg=TEXT, relief="flat",
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=ACCENT, width=30).pack(side="left", ipady=5, padx=(6, 8))
+
+        extra_status = tk.StringVar()
+        tk.Label(f, textvariable=extra_status, font=("Segoe UI", 9),
+                 bg=BG, fg=ACCENT).pack(anchor="w", pady=(0, 6))
+
+        def save_extra():
+            raw = extra_var.get().strip()
+            procs = [p.strip().lower() for p in raw.split(",") if p.strip()]
+            for p in procs:
+                BROWSER_PROCS.add(p)
+            self._save_settings(extra_browsers=procs)
+            extra_status.set(f"Saved — {len(procs)} custom browser(s) added")
+
+        tk.Button(f, text="Save extra browsers",
+                  font=("Segoe UI", 10), bg=SURFACE, fg=ACCENT,
+                  relief="flat", highlightthickness=1, highlightbackground=BORDER,
+                  padx=10, pady=5, cursor="hand2",
+                  command=save_extra).pack(anchor="w", pady=(0, 10))
+
+        tk.Button(f, text="Show process debug info",
+                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
+                  relief="flat", highlightthickness=1, highlightbackground=BORDER,
+                  padx=12, pady=6, cursor="hand2",
+                  command=self._debug_processes).pack(anchor="w")
         return f
 
 # ── Entry point ───────────────────────────────────────────────────────────────
