@@ -701,6 +701,82 @@ class SoniqueApp:
 
             threading.Thread(target=worker, daemon=True).start()
 
+        # ── Log current song ──────────────────────────────────────────────────
+
+        log_frame = tk.Frame(f, bg=BG)
+        log_frame.pack(fill="x", pady=(0, 6))
+
+        tk.Frame(log_frame, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
+
+        log_row = tk.Frame(log_frame, bg=BG)
+        log_row.pack(fill="x")
+
+        tk.Label(log_row, text="Log this song:", font=("Segoe UI", 9),
+                 bg=BG, fg=MUTED).pack(side="left")
+
+        log_mins_var = tk.StringVar(value="3")
+        tk.Label(log_row, text="  Minutes:", font=("Segoe UI", 9),
+                 bg=BG, fg=MUTED).pack(side="left")
+        tk.Entry(log_row, textvariable=log_mins_var, width=5,
+                 font=("Segoe UI", 10), bg=SURFACE, fg=TEXT,
+                 relief="flat", highlightthickness=1,
+                 highlightbackground=BORDER, highlightcolor=ACCENT
+                 ).pack(side="left", ipady=4, padx=(4, 12))
+
+        tk.Label(log_row, text="Mood:", font=("Segoe UI", 9),
+                 bg=BG, fg=MUTED).pack(side="left")
+        log_mood_var = tk.StringVar()
+        tk.Entry(log_row, textvariable=log_mood_var, width=14,
+                 font=("Segoe UI", 10), bg=SURFACE, fg=TEXT,
+                 relief="flat", highlightthickness=1,
+                 highlightbackground=BORDER, highlightcolor=ACCENT
+                 ).pack(side="left", ipady=4, padx=(4, 12))
+
+        log_status_var = tk.StringVar()
+        tk.Label(log_frame, textvariable=log_status_var,
+                 font=("Segoe UI", 9), bg=BG, fg=ACCENT).pack(anchor="w", pady=(4, 0))
+
+        def log_current():
+            man_song = man_song_var.get().strip()
+            if man_song:
+                np = {"source": "manual entry",
+                      "song": man_song,
+                      "artist": man_artist_var.get().strip()}
+            elif current_np["data"]:
+                np = current_np["data"]
+            else:
+                log_status_var.set("Nothing is playing to log.")
+                return
+            try:
+                mins = float(log_mins_var.get())
+                assert mins > 0
+            except Exception:
+                log_status_var.set("Enter a valid number of minutes.")
+                return
+            self.history.insert(0, {
+                "id":     int(time.time() * 1000),
+                "song":   np["song"],
+                "artist": np.get("artist", ""),
+                "genre":  "",
+                "mins":   mins,
+                "mood":   log_mood_var.get().strip(),
+                "ts":     datetime.now().isoformat(),
+            })
+            save_history(self.history)
+            log_mood_var.set("")
+            song_lbl = np["song"]
+            artist_lbl = np.get("artist", "")
+            msg = f"\u2713  Logged {round(mins)} min of \u201c{song_lbl}\u201d"
+            if artist_lbl:
+                msg += f" by {artist_lbl}"
+            log_status_var.set(msg)
+        tk.Button(log_row, text="Log it",
+                  font=("Segoe UI", 10, "bold"),
+                  bg=DARK, fg="white", relief="flat",
+                  padx=12, pady=5, cursor="hand2",
+                  activebackground="#0A3D2E", activeforeground="white",
+                  command=log_current).pack(side="left")
+
         get_btn.configure(command=fetch)
         return f
 
