@@ -21,9 +21,10 @@ from pathlib import Path
 # ── Dependency check ──────────────────────────────────────────────────────────
 missing = []
 try:
-    import anthropic
+    from google import genai
+    from google.genai import types
 except ImportError:
-    missing.append("anthropic")
+    missing.append("google-genai")
 try:
     from PIL import Image, ImageDraw
     import pystray
@@ -51,7 +52,7 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_FILE     = Path.home() / ".sonique_history.json"
 SETTINGS_FILE = Path.home() / ".sonique_settings.json"
-MODEL         = "claude-opus-4-5"
+MODEL         = "gemini-2.0-flash-lite"  # free tier, lighter quota
 
 GENRES = [
     "Pop", "Hip-Hop / Rap", "R&B / Soul", "Rock", "Indie / Alternative",
@@ -268,14 +269,22 @@ def taste_summary(history):
 
 def _call_ai(prompt, api_key, max_tokens=1500):
     if not api_key:
-        raise RuntimeError("No API key. Go to Settings and enter your Anthropic API key.")
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model=MODEL, max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
+        raise RuntimeError("No API key. Go to Settings and enter your Gemini API key.")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+        ),
     )
-    raw = "".join(b.text for b in msg.content if hasattr(b, "text"))
-    return raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    raw = response.text or ""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines_r = raw.splitlines()
+        lines_r = [l for l in lines_r if not l.startswith("```")]
+        raw = "\n".join(lines_r)
+    return raw.strip()
 
 
 def get_recommendations(history, mood_filter="", count=5, api_key=""):
@@ -391,7 +400,7 @@ def make_scroll_canvas(parent):
 class SoniqueApp:
     def __init__(self):
         self.history = load_history()
-        self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        self.api_key = os.environ.get("GEMINI_API_KEY", "")
         self.tray    = None
         self._last_np     = None
         self._polling     = False
@@ -574,10 +583,10 @@ class SoniqueApp:
                                 relief="flat", cursor="hand2", bd=0)
         refresh_btn.pack(side="right")
 
-        tk.Label(det_card, textvariable=song_var,
+        tk.Label(det_card, textvariable=artist_var,
                  font=("Georgia", 15, "italic", "bold"),
                  bg=SURFACE, fg=TEXT, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
-        tk.Label(det_card, textvariable=artist_var,
+        tk.Label(det_card, textvariable=song_var,
                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
                  anchor="w").pack(fill="x", padx=14, pady=(0, 10))
 
@@ -635,9 +644,34 @@ class SoniqueApp:
 
         _, inner = make_scroll_canvas(f)
 
-        status_var = tk.StringVar()
-        tk.Label(f, textvariable=status_var, font=("Segoe UI", 10),
-                 bg=BG, fg=MUTED, wraplength=660).pack(anchor="w", pady=(4, 0))
+        # Scrollable error/status box
+        err_frame = tk.Frame(f, bg=BG)
+        err_frame.pack(fill="x", pady=(4, 0))
+        err_box = tk.Text(err_frame, font=("Segoe UI", 9), bg=BG, fg=MUTED,
+                          relief="flat", wrap="word", height=4,
+                          state="disabled", bd=0)
+        err_sb = ttk.Scrollbar(err_frame, orient="vertical", command=err_box.yview)
+        err_box.configure(yscrollcommand=err_sb.set)
+        err_box.pack(side="left", fill="x", expand=True)
+        # Only show scrollbar when there's content
+        err_sb_visible = [False]
+
+        def set_status(msg, color=MUTED):
+            err_box.configure(state="normal")
+            err_box.delete("1.0", "end")
+            err_box.insert("end", msg)
+            err_box.configure(state="disabled", fg=color)
+            # Show scrollbar for long messages
+            if msg.count("\n") > 2:
+                err_sb.pack(side="right", fill="y")
+            else:
+                err_sb.pack_forget()
+
+        # Shim so existing code using status_var.set() still works
+        class _StatusVar:
+            def set(self_, msg): set_status(msg)
+            def get(self_): return err_box.get("1.0", "end").strip()
+        status_var = _StatusVar()
 
         current_np = {"data": None}
 
@@ -649,9 +683,7 @@ class SoniqueApp:
                 artist_var.set(np.get("artist", ""))
                 current_np["data"] = np
             else:
-                msg = ("Nothing detected — play a song on Spotify, YouTube, or SoundCloud"
-                       if HAS_WIN32 else "Install pywin32 for auto-detection")
-                source_var.set(msg)
+                source_var.set("" if HAS_WIN32 else "Install pywin32 for auto-detection")
                 song_var.set("")
                 artist_var.set("")
                 current_np["data"] = None
@@ -689,11 +721,13 @@ class SoniqueApp:
                     recos = get_now_playing_recommendations(
                         np, self.history, int(count_var.get() or 5), self.api_key
                     )
-                    inner.after(0, lambda: render_reco_cards(inner, recos, wrap=640))
-                    inner.after(0, lambda: status_var.set(
-                        f"Showing {len(recos)} songs that go well after {seed}"))
+                    inner.after(0, lambda r=recos: render_reco_cards(inner, r, wrap=640))
+                    inner.after(0, lambda r=recos: status_var.set(
+                        f"Showing {len(r)} songs that go well after {seed}"))
                 except Exception as e:
-                    inner.after(0, lambda: status_var.set(f"Error: {e}"))
+                    import traceback
+                    err_msg = traceback.format_exc()
+                    inner.after(0, lambda msg=err_msg: status_var.set(f"Error: {msg}"))
                 finally:
                     inner.after(0, lambda: get_btn.configure(
                         state="normal",
@@ -987,11 +1021,13 @@ class SoniqueApp:
                         self.history, mood_var.get().strip(),
                         int(count_var.get() or 5), self.api_key,
                     )
-                    inner.after(0, lambda: render_reco_cards(inner, recos, wrap=640))
-                    inner.after(0, lambda: status_var.set(
-                        f"Showing {len(recos)} recommendations based on your history"))
+                    inner.after(0, lambda r=recos: render_reco_cards(inner, r, wrap=640))
+                    inner.after(0, lambda r=recos: status_var.set(
+                        f"Showing {len(r)} recommendations based on your history"))
                 except Exception as e:
-                    inner.after(0, lambda: status_var.set(f"Error: {e}"))
+                    import traceback
+                    err_msg = traceback.format_exc()
+                    inner.after(0, lambda msg=err_msg: status_var.set(f"Error: {msg}"))
                 finally:
                     inner.after(0, lambda: get_btn.configure(
                         state="normal", text="Get recommendations"))
@@ -1044,7 +1080,7 @@ class SoniqueApp:
     def _build_settings(self, parent):
         f = tk.Frame(parent, bg=BG)
 
-        tk.Label(f, text="Anthropic API key", font=("Segoe UI", 10),
+        tk.Label(f, text="Google Gemini API key", font=("Segoe UI", 10),
                  bg=BG, fg=MUTED).pack(anchor="w")
         key_var = tk.StringVar(value=self.api_key)
         key_entry = tk.Entry(f, textvariable=key_var, font=("Segoe UI", 11),
@@ -1092,7 +1128,7 @@ class SoniqueApp:
         tk.Label(f, text=win32_ok, font=("Segoe UI", 10),
                  bg=BG, fg=ACCENT if HAS_WIN32 else AMBER).pack(anchor="w", pady=(0, 14))
 
-        tk.Label(f, text="Get your API key at  console.anthropic.com",
+        tk.Label(f, text="Get your FREE API key at  aistudio.google.com/apikey",
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w")
         tk.Label(f, text=f"History file:  {DATA_FILE}",
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w", pady=(4, 0))
@@ -1148,7 +1184,8 @@ class SoniqueApp:
 
 if __name__ == "__main__":
     app = SoniqueApp()
-    if not app.api_key:
-        threading.Thread(target=lambda: app._show_window("settings"), daemon=True).start()
-        time.sleep(0.3)
+    # Always open the window on launch
+    tab = "settings" if not app.api_key else "nowplaying"
+    threading.Thread(target=lambda: app._show_window(tab), daemon=True).start()
+    time.sleep(0.3)
     app.run()
