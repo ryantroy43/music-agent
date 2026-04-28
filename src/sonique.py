@@ -21,10 +21,9 @@ from pathlib import Path
 # ── Dependency check ──────────────────────────────────────────────────────────
 missing = []
 try:
-    from google import genai
-    from google.genai import types
+    import ollama
 except ImportError:
-    missing.append("google-genai")
+    missing.append("ollama")
 try:
     from PIL import Image, ImageDraw
     import pystray
@@ -52,7 +51,7 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_FILE     = Path.home() / ".sonique_history.json"
 SETTINGS_FILE = Path.home() / ".sonique_settings.json"
-MODEL         = "gemini-2.0-flash-lite"  # free tier, lighter quota
+MODEL         = "llama3.2"  # ollama local model
 
 GENRES = [
     "Pop", "Hip-Hop / Rap", "R&B / Soul", "Rock", "Indie / Alternative",
@@ -267,18 +266,12 @@ def taste_summary(history):
     ])
 
 
-def _call_ai(prompt, api_key, max_tokens=1500):
-    if not api_key:
-        raise RuntimeError("No API key. Go to Settings and enter your Gemini API key.")
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
+def _call_ai(prompt, api_key=None, max_tokens=1500):
+    response = ollama.chat(
         model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
+        messages=[{"role": "user", "content": prompt}],
     )
-    raw = response.text or ""
+    raw = response["message"]["content"]
     raw = raw.strip()
     if raw.startswith("```"):
         lines_r = raw.splitlines()
@@ -287,7 +280,7 @@ def _call_ai(prompt, api_key, max_tokens=1500):
     return raw.strip()
 
 
-def get_recommendations(history, mood_filter="", count=5, api_key=""):
+def get_recommendations(history, mood_filter="", count=5, api_key=None):
     profile   = taste_summary(history)
     mood_line = f"\nUser's current mood: {mood_filter}" if mood_filter else ""
     prompt = f"""You are an expert music recommendation AI.
@@ -305,7 +298,7 @@ Each element must have exactly these keys:
     return json.loads(_call_ai(prompt, api_key))
 
 
-def get_now_playing_recommendations(now_playing, history, count=5, api_key=""):
+def get_now_playing_recommendations(now_playing, history, count=5, api_key=None):
     song   = now_playing["song"]
     artist = now_playing.get("artist", "")
     source = now_playing["source"]
@@ -642,7 +635,23 @@ class SoniqueApp:
                             activebackground=DARK, activeforeground="white")
         get_btn.pack(side="left")
 
-        _, inner = make_scroll_canvas(f)
+        # Fixed-height scroll area so log row stays visible
+        scroll_frame = tk.Frame(f, bg=BG, height=180)
+        scroll_frame.pack(fill="x")
+        scroll_frame.pack_propagate(False)
+        canvas_np = tk.Canvas(scroll_frame, bg=BG, highlightthickness=0)
+        vsb_np    = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas_np.yview)
+        canvas_np.configure(yscrollcommand=vsb_np.set)
+        canvas_np.pack(side="left", fill="both", expand=True)
+        vsb_np.pack(side="right", fill="y")
+        inner    = tk.Frame(canvas_np, bg=BG)
+        inner_id = canvas_np.create_window((0, 0), window=inner, anchor="nw")
+
+        def _np_cfg(event):
+            canvas_np.configure(scrollregion=canvas_np.bbox("all"))
+            canvas_np.itemconfig(inner_id, width=canvas_np.winfo_width())
+        inner.bind("<Configure>", _np_cfg)
+        canvas_np.bind("<Configure>", lambda e: canvas_np.itemconfig(inner_id, width=e.width))
 
         # Scrollable error/status box
         err_frame = tk.Frame(f, bg=BG)
@@ -1080,32 +1089,26 @@ class SoniqueApp:
     def _build_settings(self, parent):
         f = tk.Frame(parent, bg=BG)
 
-        tk.Label(f, text="Google Gemini API key", font=("Segoe UI", 10),
+        tk.Label(f, text="Ollama model", font=("Segoe UI", 10),
                  bg=BG, fg=MUTED).pack(anchor="w")
-        key_var = tk.StringVar(value=self.api_key)
+        key_var = tk.StringVar(value=MODEL)
         key_entry = tk.Entry(f, textvariable=key_var, font=("Segoe UI", 11),
-                             bg=SURFACE, fg=TEXT, show="*", width=52,
+                             bg=SURFACE, fg=TEXT, show="", width=52,
                              relief="flat", highlightthickness=1,
                              highlightbackground=BORDER, highlightcolor=ACCENT)
         key_entry.pack(anchor="w", ipady=6, pady=(2, 4), fill="x")
 
-        def toggle_show():
-            key_entry.configure(show="" if key_entry.cget("show") == "*" else "*")
-            show_btn.configure(text="Hide" if key_entry.cget("show") == "" else "Show")
 
-        show_btn = tk.Button(f, text="Show", font=("Segoe UI", 9),
-                             bg=BG, fg=MUTED, relief="flat", cursor="hand2",
-                             command=toggle_show)
-        show_btn.pack(anchor="w", pady=(0, 12))
 
         status_var = tk.StringVar()
         tk.Label(f, textvariable=status_var, font=("Segoe UI", 10),
                  bg=BG, fg=ACCENT).pack(anchor="w", pady=(0, 8))
 
         def save_key():
-            self.api_key = key_var.get().strip()
+            global MODEL
+            MODEL = key_var.get().strip() or "llama3.2"
             self._save_settings()
-            status_var.set("API key saved")
+            status_var.set(f"Model set to {MODEL}")
 
         tk.Button(f, text="Save API key",
                   font=("Segoe UI", 11, "bold"),
@@ -1128,7 +1131,7 @@ class SoniqueApp:
         tk.Label(f, text=win32_ok, font=("Segoe UI", 10),
                  bg=BG, fg=ACCENT if HAS_WIN32 else AMBER).pack(anchor="w", pady=(0, 14))
 
-        tk.Label(f, text="Get your FREE API key at  aistudio.google.com/apikey",
+        tk.Label(f, text="Ollama running locally — no API key needed. Change model name above if needed.",
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w")
         tk.Label(f, text=f"History file:  {DATA_FILE}",
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w", pady=(4, 0))
