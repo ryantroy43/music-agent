@@ -293,7 +293,23 @@ Respond ONLY with a valid JSON array — no markdown, no extra text.
 Each element must have exactly these keys:
   "song", "artist", "genre", "match" (e.g. "94%"),
   "why" (2-3 sentences referencing their taste),
-  "tags" (array of 3 short tags)
+  "tags" (array of 3 short tags),
+  "link" (best direct link: YouTube, Spotify, or Apple Music URL)
+
+Prefer YouTube links when possible (most reliable). Use this format for links:
+- YouTube: "https://www.youtube.com/results?search_query=Song+Artist"
+- Or a direct track link if you're confident.
+
+Example:
+{{
+  "song": "Blinding Lights",
+  "artist": "The Weeknd",
+  "genre": "Synthwave / Pop",
+  "match": "96%",
+  "why": "Matches your love for 80s-inspired synth pop and upbeat energy...",
+  "tags": ["synthwave", "night drive", "catchy"],
+  "link": "https://www.youtube.com/results?search_query=Blinding+Lights+The+Weeknd"
+}}
 """
     return json.loads(_call_ai(prompt, api_key))
 
@@ -317,7 +333,21 @@ Respond ONLY with a valid JSON array — no markdown, no extra text.
 Each element must have exactly these keys:
   "song", "artist", "genre", "match" (e.g. "94%"),
   "why" (2-3 sentences explaining why it flows well from the current song),
-  "tags" (array of 3 short tags)
+  "tags" (array of 3 short tags),
+  "link" (best direct link: YouTube, Spotify, or Apple Music URL)
+
+Prefer YouTube links. Use search query format for reliability.
+
+Example structure for each recommendation:
+{{
+  "song": "Save Your Tears",
+  "artist": "The Weeknd",
+  "genre": "Synth Pop",
+  "match": "93%",
+  "why": "Perfect follow-up with similar retro synth production and emotional delivery...",
+  "tags": ["emotional", "danceable", "80s vibe"],
+  "link": "https://www.youtube.com/results?search_query=Save+Your+Tears+The+Weeknd"
+}}
 """
     return json.loads(_call_ai(prompt, api_key))
 
@@ -334,20 +364,23 @@ def make_icon_image():
     return img
 
 # ── Shared reco card renderer ─────────────────────────────────────────────────
+import webbrowser
 
 def render_reco_cards(inner, recos, wrap=600):
     for w in inner.winfo_children():
         w.destroy()
+
     for i, r in enumerate(recos):
         border = ACCENT if i == 0 else BORDER
-        card   = tk.Frame(inner, bg=SURFACE,
-                          highlightthickness=2 if i == 0 else 1,
-                          highlightbackground=border)
+        card = tk.Frame(inner, bg=SURFACE,
+                        highlightthickness=2 if i == 0 else 1,
+                        highlightbackground=border)
         card.pack(fill="x", pady=(0, 10), padx=2)
 
+        # Top row: Song + Match %
         top = tk.Frame(card, bg=SURFACE)
         top.pack(fill="x", padx=14, pady=(12, 4))
-        tk.Label(top, text=("✦ " if i == 0 else f"#{i+1}  ") + r["song"],
+        tk.Label(top, text=("✦ " if i == 0 else f"#{i+1}  ") + r.get("song", ""),
                  font=("Georgia", 13, "italic", "bold"),
                  bg=SURFACE, fg=ACCENT if i == 0 else TEXT,
                  anchor="w").pack(side="left")
@@ -355,13 +388,54 @@ def render_reco_cards(inner, recos, wrap=600):
                  font=("Segoe UI", 10, "bold"),
                  bg=SURFACE, fg=ACCENT).pack(side="right")
 
-        tk.Label(card, text=f"{r['artist']}  ·  {r.get('genre','')}",
+        # Artist + Genre
+        tk.Label(card, text=f"{r.get('artist', '')}  ·  {r.get('genre','')}",
                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
                  anchor="w").pack(fill="x", padx=14, pady=(0, 6))
-        tk.Label(card, text="  ".join(f"#{t}" for t in r.get("tags", [])),
-                 font=("Segoe UI", 9), bg=SURFACE, fg=MUTED,
-                 anchor="w").pack(fill="x", padx=14)
-        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
+
+        # Tags
+        tags = r.get("tags", [])
+        if tags:
+            tk.Label(card, text="  ".join(f"#{t}" for t in tags),
+                     font=("Segoe UI", 9), bg=SURFACE, fg=MUTED,
+                     anchor="w").pack(fill="x", padx=14)
+
+        # ── Link Buttons Row ─────────────────────────────────────
+        link_buttons = tk.Frame(card, bg=SURFACE)
+        link_buttons.pack(anchor="w", padx=14, pady=(8, 0))
+
+        link = r.get("link", "").strip()
+
+        # YouTube / General Link Button
+        if link and (link.startswith("http://") or link.startswith("https://")):
+            tk.Button(link_buttons, text="▶ Open Link",
+                      font=("Segoe UI", 9, "bold"),
+                      bg="#E8F5E9", fg="#1D9E75", relief="flat",
+                      padx=12, pady=4, cursor="hand2",
+                      command=lambda url=link: webbrowser.open(url)
+                      ).pack(side="left", padx=(0, 8))
+
+        # Spotify-specific button (detects spotify.com or spotify: URI)
+        spotify_link = None
+        if link:
+            lower_link = link.lower()
+            if "spotify.com" in lower_link or lower_link.startswith("spotify:"):
+                spotify_link = link
+            elif r.get("artist") and r.get("song"):
+                # Fallback: generate a clean Spotify search link
+                query = f"{r['song']} {r['artist']}".replace(" ", "%20")
+                spotify_link = f"https://open.spotify.com/search/{query}"
+
+        if spotify_link:
+            tk.Button(link_buttons, text="🎵 Play on Spotify",
+                      font=("Segoe UI", 9, "bold"),
+                      bg="#1DB954", fg="white", relief="flat",
+                      padx=14, pady=4, cursor="hand2",
+                      command=lambda url=spotify_link: webbrowser.open(url)
+                      ).pack(side="left")
+
+        # Why text
+        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(10, 8))
         tk.Label(card, text=r.get("why", ""),
                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
                  wraplength=wrap, justify="left",
