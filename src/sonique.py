@@ -993,7 +993,7 @@ class SoniqueApp:
         tbl = tk.Frame(f, bg=BG)
         tbl.pack(fill="both", expand=True)
 
-        cols = ("Song", "Artist", "Genre", "Mood", "Min", "Date")
+        cols = ("Artist", "Song", "Genre", "Mood", "Min", "Date")
         tree = ttk.Treeview(tbl, columns=cols, show="headings", height=10)
         for col, w in zip(cols, [180, 150, 120, 100, 50, 80]):
             tree.heading(col, text=col)
