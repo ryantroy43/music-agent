@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
 from pathlib import Path 
-import sqlite3
+
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 missing = []
@@ -50,7 +50,7 @@ except ImportError:
     HAS_WIN32 = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_FILE     = Path.home() / ".sonique_database.py"
+DATA_FILE     = Path.home() / ".sonique_history.json"
 SETTINGS_FILE = Path.home() / ".sonique_settings.json"
 MODEL         = "llama3.2"  # ollama local model
 
@@ -231,69 +231,13 @@ def detect_now_playing():
 
 # ── Data layer ────────────────────────────────────────────────────────────────
 
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            song TEXT,
-            artist TEXT,
-            genre TEXT,
-            mins REAL,
-            mood TEXT,
-            ts TEXT
-        )
-    """)
-    conn.commit()
-    return conn
-
 def load_history():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, song, artist, genre, mins, mood, ts
-        FROM history
-        ORDER BY id DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    return [
-        {
-            "id": r[0],
-            "song": r[1],
-            "artist": r[2],
-            "genre": r[3],
-            "mins": r[4],
-            "mood": r[5],
-            "ts": r[6],
-        }
-        for r in rows
-    ]
-
-
-def insert_song(entry):
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO history (song, artist, genre, mins, mood, ts)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        entry["song"],
-        entry["artist"],
-        entry.get("genre", ""),
-        entry["mins"],
-        entry.get("mood", ""),
-        entry["ts"]
-    ))
-    conn.commit()
-    conn.close()
-
-
-def delete_song(song_id):
-    conn = get_db()
-    conn.execute("DELETE FROM history WHERE id = ?", (song_id,))
-    conn.commit()
-    conn.close()
+    if DATA_FILE.exists():
+        try:
+            return json.loads(DATA_FILE.read_text())
+        except Exception:
+            return []
+    return []
 
 # ── AI layer ──────────────────────────────────────────────────────────────────
 
