@@ -275,8 +275,10 @@ def load_history():
     By immediately returning generate_random_history(), the app will ignore 
     the saved JSON file and give you a fresh, random user profile EVERY time you run it.
     """
-    # Pick a random number of history tracks between 10 and 20 for the session
-    return generate_random_history(random.randint(10, 20))
+    # Start Fresh every launch
+    DATA_FILE.unlink(missing_ok=True)
+    # Pick a random number of history tracks between 10 and 30 for the session
+    return generate_random_history(random.randint(10, 30))
 
 def save_history(history):
     DATA_FILE.write_text(json.dumps(history, indent=2))

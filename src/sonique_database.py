@@ -255,17 +255,20 @@ class SoniqueProDB:
         if not history:
             return self.popular(limit)
 
-        # Extract ALL unique artists and genres from the user's history
-        artists = list(set([h.get("artist") for h in history if h.get("artist")]))
-        genres = list(set([h.get("genre") for h in history if h.get("genre")]))
+        # Rank preferences by frequency to create "weights"
+        artist_counts = {}
+        genre_counts = {}
+        for h in history:
+            a, g = h.get("artist"), h.get("genre")
+            if a: artist_counts[a] = artist_counts.get(a, 0) + 1
+            if g: genre_counts[g] = genre_counts.get(g, 0) + 1
 
-        # Fallback if history objects are somehow completely empty
-        if not artists and not genres:
-            return self.popular(limit)
+        # Get unique lists for the SQL query
+        artists = list(artist_counts.keys())
+        genres = list(genre_counts.keys())
+        total_logs = len(history)
 
         c = self.conn.cursor()
-        
-        # Build dynamic IN clauses to search the whole database for matches
         artist_marks = ",".join("?" * len(artists)) if artists else "''"
         genre_marks = ",".join("?" * len(genres)) if genres else "''"
         
@@ -276,42 +279,52 @@ class SoniqueProDB:
             query += " AND lower(mood)=lower(?)"
             params.append(mood_filter.strip())
             
-        query += " ORDER BY popularity DESC LIMIT ?"
-        params.append(limit)
-
         c.execute(query, params)
         rows = c.fetchall()
-        
-        if not rows and mood_filter:
-            fallback_query = f"SELECT * FROM songs WHERE (artist IN ({artist_marks}) OR genre IN ({genre_marks})) ORDER BY popularity DESC LIMIT ?"
-            c.execute(fallback_query, artists + genres + [limit])
-            rows = c.fetchall()
 
-        # Format the matches we found
+        # ALGORITHM: Calculate real match percentage based on history weights
+        scored_results = []
+        for r in rows:
+            # Base confidence
+            score = 70.0 
+            
+            # Boost based on Artist familiarity (Weight: 25%)
+            if r["artist"] in artist_counts:
+                score += (artist_counts[r["artist"]] / total_logs) * 25
+                
+            # Boost based on Genre preference (Weight: 10%)
+            if r["genre"] in genre_counts:
+                score += (genre_counts[r["genre"]] / total_logs) * 10
+            
+            # Small boost for high popularity (Weight: 5%)
+            score += (r["popularity"] / 100) * 5
+
+            scored_results.append((score, r))
+
+        # Sort by the calculated scores
+        scored_results.sort(key=lambda x: x[0], reverse=True)
+
+        # Format with the calculated percentage
         results = [
             {
                 "song": r["song"],
                 "artist": r["artist"],
                 "genre": r["genre"],
-                "match": "95%",
-                "why": f"Based on your recent listening history.",
+                "match": f"{int(self.clamp(score, 75, 99))}%", # Use the real score!
+                "why": f"Matches your preference for {r['genre']} and {r['artist']}.",
                 "tags": [r["genre"].lower(), r["mood"].lower(), "history"]
             }
-            for r in rows
+            for score, r in scored_results[:limit]
         ]
 
+        # Ultimate Fallback (Randomized Popular)
         if len(results) < limit:
-            current_songs = [r["song"] for r in results]
-            
-            # Fetch extra popular songs to fill the gaps
-            pop_songs = self.popular(limit + len(results)) 
-            for p in pop_songs:
+            current_songs = [res["song"] for res in results]
+            pop_pool = self.popular(limit + 5)
+            for p in pop_pool:
                 if p["song"] not in current_songs:
-                    p["why"] = "Recommended popular track to expand your taste."
-                    p["tags"] = [p["genre"].lower(), "popular"]
                     results.append(p)
-                if len(results) == limit:
-                    break
+                if len(results) == limit: break
 
         return results
 
@@ -320,12 +333,16 @@ class SoniqueProDB:
     
     def popular(self, limit=5):
         c = self.conn.cursor()
+        
         c.execute("""
         SELECT * FROM songs
         ORDER BY popularity DESC
-        LIMIT ?
-        """, (limit,))
+        LIMIT 20
+        """)
         rows = c.fetchall()
+        
+        # Shuffle and select the requested amount
+        chosen = random.sample(rows, min(limit, len(rows)))
 
         return [
             {
@@ -336,5 +353,5 @@ class SoniqueProDB:
                 "why": "A popular favorite across all listeners.",
                 "tags": [r["genre"].lower(), r["mood"].lower(), "popular"]
             }
-            for r in rows
+            for r in chosen
         ]
