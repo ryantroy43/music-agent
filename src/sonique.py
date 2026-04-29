@@ -232,7 +232,7 @@ def detect_now_playing():
 # ── Data layer ────────────────────────────────────────────────────────────────
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DATA_FILE)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
