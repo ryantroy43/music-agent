@@ -1,1261 +1,340 @@
 """
-Sonique — AI Music Recommendation Agent
-Windows system tray app with Now Playing detection.
-
-Install:  pip install anthropic pystray pillow pywin32
-Run:      pythonw sonique.py   (no console window)
-          python  sonique.py   (with console, for debugging)
+SONIQUE PRO DATABASE
+Advanced local recommendation engine for Sonique
 """
 
-import json
-import os
-import re
-import sys
-import threading
-import time
-import tkinter as tk
-from tkinter import ttk
-from datetime import datetime
+import sqlite3
+import math
+import random
 from pathlib import Path
 
-# ── Dependency check ──────────────────────────────────────────────────────────
-missing = []
-try:
-    import ollama
-except ImportError:
-    missing.append("ollama")
-try:
-    from PIL import Image, ImageDraw
-    import pystray
-except ImportError:
-    missing.append("pystray pillow")
-
-if missing:
-    root = tk.Tk(); root.withdraw()
-    from tkinter import messagebox
-    messagebox.showerror(
-        "Missing packages",
-        f"Run this in PowerShell:\n\npy -m pip install {' '.join(missing)}"
-    )
-    sys.exit(1)
-
-# pywin32 is optional — needed for window title scanning
-try:
-    import win32gui
-    import win32process
-    import psutil
-    HAS_WIN32 = True
-except ImportError:
-    HAS_WIN32 = False
-
-# ── Config ────────────────────────────────────────────────────────────────────
-DATA_FILE     = Path.home() / ".sonique_history.json"
-SETTINGS_FILE = Path.home() / ".sonique_settings.json"
-MODEL         = "llama3.2"  # ollama local model
-
-GENRES = [
-    "Pop", "Hip-Hop / Rap", "R&B / Soul", "Rock", "Indie / Alternative",
-    "Electronic / EDM", "Jazz", "Classical", "Country", "Metal",
-    "Folk / Acoustic", "Latin", "K-Pop", "Afrobeats", "Reggae", "Other",
-]
-
-ACCENT  = "#1D9E75"
-DARK    = "#0F6E56"
-BG      = "#F8F8F7"
-SURFACE = "#FFFFFF"
-BORDER  = "#E0DED8"
-TEXT    = "#1A1A18"
-MUTED   = "#6B6B68"
-RED     = "#A32D2D"
-RED_BG  = "#FCEBEB"
-AMBER   = "#854F0B"
-
-# ── Now Playing detection ─────────────────────────────────────────────────────
-
-# YouTube title formats vary by browser and whether playing:
-#   Chrome/Edge:  "Song - Artist - YouTube"  or  "▶ Song - Artist - YouTube"
-#   Firefox:      "Song - Artist — YouTube"
-#   Some videos:  "Song - YouTube"  (no artist in title)
-# SoundCloud:     "Song - Artist on SoundCloud"  or  "Song by Artist on SoundCloud"
-# Tidal:          "Song - Artist | TIDAL"
-# Apple Music:    "Song - Artist - Apple Music"
-# Amazon Music:   "Song by Artist - Amazon Music"
-# Deezer:         "Song - Artist - Deezer"  or  "Song by Artist - Deezer"
-# Spotify:        "Song - Artist"  (bare, no suffix — checked last to avoid false positives)
-
-_YT = re.compile(
-    r"^[▶►\s]*"                       # optional playing indicator
-    r"(?:\(\d+\)\s*)?"             # optional notification count e.g. "(3) "
-    r"(.+?)"                           # song (and maybe artist)
-    r"(?:\s*[-–]\s*(.+?))?"     # optional " - Artist" portion
-    r"\s*[-–—]\s*YouTube"  # "- YouTube" marker
-    r"(?:\s*[-–—]\s*.+?)?$",  # optional browser suffix: "- Opera", "- Chrome"
-    re.IGNORECASE,
-)
-_SC = re.compile(
-    r"^(.+?)\s+(?:by|[-–])\s+(.+?)\s+on SoundCloud",
-    re.IGNORECASE,
-)
-_TIDAL = re.compile(r"^(.+?)\s*[-–]\s*(.+?)\s*\|\s*TIDAL", re.IGNORECASE)
-_AM    = re.compile(r"^(.+?)\s*[-–]\s*(.+?)\s*[-–]\s*Apple Music$", re.IGNORECASE)
-_AMZ   = re.compile(r"^(.+?)\s+by\s+(.+?)\s*(?:[-–]|on)\s*Amazon Music", re.IGNORECASE)
-_DEZ   = re.compile(r"^(.+?)\s*(?:by\s+(.+?)\s*[-–]|[-–]\s*(.+?))\s*[-–]\s*Deezer$", re.IGNORECASE)
-_SPOT  = re.compile(
-    r"^(?!.*(?:Visual Studio|Code|Chrome|Firefox|Edge|Opera|Brave|Explorer|"
-    r"Notepad|Word|Excel|PowerPoint|Outlook|Teams|Slack|Discord|Steam|cmd|"
-    r"PowerShell|Task Manager|Settings|Control Panel|File Explorer|"
-    r"\.[a-z]{2,4}\s*[-–]))(.+?)\s*[-–]\s*(.+?)$"
-)
+DB_FILE = Path.home() / ".sonique_pro.db"
 
 
-def _parse_youtube(title):
-    m = _YT.match(title)
-    if not m:
-        return None
-    part1 = m.group(1).strip()
-    part2 = (m.group(2) or "").strip()
-    # If we have two parts, part1=song, part2=artist
-    # If only one part, the whole thing is the video title (song only)
-    return {"source": "YouTube", "song": part1, "artist": part2, "raw": title}
-
-
-def _parse_generic(source, m, title):
-    if not m:
-        return None
-    groups = [g.strip() for g in m.groups() if g]
-    song   = groups[0] if groups else ""
-    artist = groups[1] if len(groups) > 1 else ""
-    if len(song) < 2:
-        return None
-    return {"source": source, "song": song, "artist": artist, "raw": title}
-
-
-NOW_PLAYING_PATTERNS = []  # not used directly anymore
-
-SKIP_TITLES = {"", "Program Manager", "Windows Default Lock Screen"}
-
-
-def get_process_name(hwnd):
-    """Return the exe name (lowercase) for a given window handle."""
-    try:
-        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        proc = psutil.Process(pid)
-        return proc.name().lower()
-    except Exception:
-        return ""
-
-
-def get_all_window_titles():
-    """Return list of (title, process_name) for all visible windows."""
-    if not HAS_WIN32:
-        return []
-    results = []
-    def callback(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            t = win32gui.GetWindowText(hwnd).strip()
-            if t and t not in SKIP_TITLES:
-                proc = get_process_name(hwnd)
-                results.append((t, proc))
-    win32gui.EnumWindows(callback, None)
-    return results
-
-
-# Browser process names for YouTube/SoundCloud/web players
-BROWSER_PROCS = {
-    "chrome.exe", "msedge.exe", "firefox.exe",
-    "opera.exe", "opera_gx.exe", "opera_autoupdate.exe",  # Opera & Opera GX
-    "brave.exe", "vivaldi.exe", "iexplore.exe", "chromium.exe",
-    "waterfox.exe", "librewolf.exe", "palemoon.exe", "basilisk.exe",
-    "thorium.exe", "arc.exe",
-}
-
-# Partial process name matches (substring) for browsers that use generic names
-BROWSER_PROC_SUBSTRINGS = ("opera", "browser", "chrom", "firefox", "brave", "vivaldi")
-# Spotify process names
-SPOTIFY_PROCS = {"spotify.exe"}
-
-
-def detect_now_playing():
-    windows = get_all_window_titles()
-    for title, proc in windows:
-        is_browser = (proc in BROWSER_PROCS or
-                      any(s in proc for s in BROWSER_PROC_SUBSTRINGS))
-        is_spotify = proc in SPOTIFY_PROCS
-
-        # YouTube — must be a browser
-        if is_browser:
-            result = _parse_youtube(title)
-            if result:
-                return result
-
-        # SoundCloud — must be a browser
-        if is_browser:
-            result = _parse_generic("SoundCloud", _SC.match(title), title)
-            if result:
-                return result
-
-        # Tidal — browser or desktop app
-        result = _parse_generic("Tidal", _TIDAL.match(title), title)
-        if result:
-            return result
-
-        # Apple Music — browser
-        if is_browser:
-            result = _parse_generic("Apple Music", _AM.match(title), title)
-            if result:
-                return result
-
-        # Amazon Music — browser
-        if is_browser:
-            result = _parse_generic("Amazon Music", _AMZ.match(title), title)
-            if result:
-                return result
-
-        # Deezer — browser
-        if is_browser:
-            dm = _DEZ.match(title)
-            if dm:
-                song   = (dm.group(1) or "").strip()
-                artist = (dm.group(2) or dm.group(3) or "").strip()
-                if len(song) >= 2:
-                    return {"source": "Deezer", "song": song, "artist": artist, "raw": title}
-
-        # Spotify — ONLY match if the process is actually spotify.exe
-        if is_spotify:
-            result = _parse_generic("Spotify", _SPOT.match(title), title)
-            if result:
-                return result
-
-    return None
-
-# ── Data layer & Database Init ────────────────────────────────────────────────
-
-import json
-import random
-from datetime import datetime, timedelta
-from sonique_database import SoniqueProDB
-
-local_db = SoniqueProDB()
-
-def generate_random_history(num_songs=4):
-    """Pulls random songs from the local SQLite database to simulate past listening."""
-    # Fetch a pool of available songs (our 15 demo songs)
-    pool = local_db.popular(15) 
-    
-    # Select a random subset
-    chosen = random.sample(pool, min(num_songs, len(pool)))
-    
-    history = []
-    now = datetime.now()
-    
-    for i, track in enumerate(chosen):
-        # Generate a fake timestamp from sometime in the last 5 hours
-        ts = (now - timedelta(minutes=random.randint(10, 300))).isoformat()
-        
-        # We can extract the mood safely from the tags array the DB generated
-        mood = track["tags"][1] if len(track.get("tags", [])) > 1 else ""
-        
-        history.append({
-            "id": i + 1,
-            "song": track["song"],
-            "artist": track["artist"],
-            "genre": track["genre"],
-            "mins": random.randint(3, 20), # Random listening duration
-            "mood": mood,
-            "ts": ts
-        })
-        
-    # Sort chronologically so the newest song is at the top of the UI
-    history.sort(key=lambda x: x["ts"], reverse=True)
-    return history
-
-def load_history():
-    """
-    TESTING MODE: 
-    By immediately returning generate_random_history(), the app will ignore 
-    the saved JSON file and give you a fresh, random user profile EVERY time you run it.
-    """
-    # Pick a random number of history tracks between 2 and 5 for this session
-    return generate_random_history(random.randint(2, 5))
-
-def save_history(history):
-    # We still need this function so the app doesn't crash when you click "Log Song",
-    # but the load_history() function above will just ignore this file on the next boot.
-    DATA_FILE.write_text(json.dumps(history, indent=2))
-
-# ── AI layer (Hybrid Architecture) ────────────────────────────────────────────
-
-def taste_summary(history):
-    genre_map, artist_map, moods = {}, {}, []
-    for e in history:
-        if e.get("genre"):
-            genre_map[e["genre"]] = genre_map.get(e["genre"], 0) + e["mins"]
-        artist_map[e["artist"]] = artist_map.get(e["artist"], 0) + e["mins"]
-        if e.get("mood"):
-            moods.append(e["mood"].lower())
-            
-    top_genres   = sorted(genre_map.items(),  key=lambda x: -x[1])[:5]
-    top_artists  = sorted(artist_map.items(), key=lambda x: -x[1])[:6]
-    unique_moods = list(dict.fromkeys(moods))[:6]
-    recent = [f'"{e["song"]}" by {e["artist"]} ({round(e["mins"])} min)' for e in history[:15]]
-    total  = round(sum(e["mins"] for e in history))
-    
-    return "\n".join([
-        f"Total listening time: {total} minutes",
-        f"Top genres: {', '.join(f'{g} ({round(m)} min)' for g,m in top_genres) or 'mixed'}",
-        f"Top artists: {', '.join(f'{a} ({round(m)} min)' for a,m in top_artists) or 'various'}",
-        f"Preferred moods: {', '.join(unique_moods) or 'not specified'}",
-        f"Recent songs: {', '.join(recent)}",
-    ])
-
-def _call_ai(prompt, api_key=""):
-    import ollama
-    
-    response = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        format='json'
-    )
-    
-    raw_text = response['message']['content'].strip()
-    parsed_data = None
-
-    # 1. Regex Extraction
-    match = re.search(r'\[.*\]', raw_text, re.DOTALL)
-    if match:
-        try:
-            parsed_data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    # 2. Raw Fallback
-    if parsed_data is None:
-        try:
-            parsed_data = json.loads(raw_text)
-        except json.JSONDecodeError:
-            return []
-
-    # 3. Normalization (Unwrap Dictionaries if Ollama hallucinates)
-    if isinstance(parsed_data, dict):
-        for value in parsed_data.values():
-            if isinstance(value, list):
-                return value 
-        return [parsed_data]
-    elif isinstance(parsed_data, list):
-        return parsed_data
-    else:
-        return []
-
-# ROUTE 1: The Recs Tab (Bypasses Ollama -> Uses SoniqueProDB)
-def get_recommendations(history, mood_filter="", count=5, api_key=""):
-    """
-    Directly routes history recommendations to the local SQLite database
-    to avoid LLM context-window hallucinations.
-    """
-    return local_db.recommend_from_history(history, mood_filter, count)
-
-# ROUTE 2: The Now Playing Tab (Uses Ollama)
-def get_now_playing_recommendations(now_playing, history, count=5, api_key=""):
-    """
-    Uses the local Ollama model to dynamically infer the vibe of the live track.
-    Restored to the original declarative prompt structure that Llama 3.2 prefers.
-    """
-    song   = now_playing["song"]
-    artist = now_playing.get("artist", "")
-    source = now_playing["source"]
-
-    history_context = ""
-    if history:
-        profile = taste_summary(history)
-        history_context = f"\n\nADDITIONAL CONTEXT — listener's broader taste:\n{profile}"
-
-    seed = f'"{song}"' + (f" by {artist}" if artist else "")
-    
-    prompt = f"""You are an expert music recommendation AI.
-The listener is currently playing {seed} on {source}.
-Recommend {count} songs that would sound great playing next — similar vibe, energy, or style.{history_context}
-
-Respond ONLY with a valid JSON array — no markdown, no extra text.
-Each element must have exactly these keys:
-  "song", "artist", "genre", "match" (e.g. "94%"),
-  "why" (2-3 sentences explaining why it flows well from the current song),
-  "tags" (array of 3 short tags)
-"""
-    return _call_ai(prompt, api_key)
-# ── Tray icon ─────────────────────────────────────────────────────────────────
-
-def make_icon_image():
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d   = ImageDraw.Draw(img)
-    d.ellipse([2, 2, size-2, size-2], fill="#1D9E75")
-    d.ellipse([18, 38, 30, 48], fill="white")
-    d.rectangle([28, 20, 32, 44], fill="white")
-    d.polygon([(32, 20), (46, 26), (32, 32)], fill="white")
-    return img
-
-# ── Shared reco card renderer ─────────────────────────────────────────────────
-
-def render_reco_cards(inner, recos, wrap=600):
-    for w in inner.winfo_children():
-        w.destroy()
-        
-    for i, r in enumerate(recos):
-        border = ACCENT if i == 0 else BORDER
-        card   = tk.Frame(inner, bg=SURFACE,
-                          highlightthickness=2 if i == 0 else 1,
-                          highlightbackground=border)
-        card.pack(fill="x", pady=(0, 10), padx=2)
-
-        top = tk.Frame(card, bg=SURFACE)
-        top.pack(fill="x", padx=14, pady=(12, 4))
-        
-        # Safely render the song title using .get() to prevent hard crashes if a key is missing
-        tk.Label(top, text=("✦ " if i == 0 else f"#{i+1}  ") + r.get("song", "Unknown Title"),
-                 font=("Georgia", 13, "italic", "bold"),
-                 bg=SURFACE, fg=ACCENT if i == 0 else TEXT,
-                 anchor="w").pack(side="left")
-                 
-        tk.Label(top, text=r.get("match", ""),
-                 font=("Segoe UI", 10, "bold"),
-                 bg=SURFACE, fg=ACCENT).pack(side="right")
-
-        tk.Label(card, text=f"{r.get('artist', 'Unknown')}  ·  {r.get('genre','')}",
-                 font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
-                 anchor="w").pack(fill="x", padx=14, pady=(0, 6))
-                 
-        tk.Label(card, text="  ".join(f"#{t}" for t in r.get("tags", [])),
-                 font=("Segoe UI", 9), bg=SURFACE, fg=MUTED,
-                 anchor="w").pack(fill="x", padx=14)
-                 
-        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
-        
-        tk.Label(card, text=r.get("why", ""),
-                 font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
-                 wraplength=wrap, justify="left",
-                 anchor="w").pack(fill="x", padx=14, pady=(0, 14))
-
-def make_scroll_canvas(parent):
-    """Return (canvas, inner_frame) with auto-scroll setup."""
-    frame  = tk.Frame(parent, bg=BG)
-    frame.pack(fill="both", expand=True)
-    canvas = tk.Canvas(frame, bg=BG, highlightthickness=0)
-    vsb    = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-    canvas.configure(yscrollcommand=vsb.set)
-    canvas.pack(side="left", fill="both", expand=True)
-    vsb.pack(side="right", fill="y")
-    inner    = tk.Frame(canvas, bg=BG)
-    inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-    def on_cfg(event):
-        canvas.configure(scrollregion=canvas.bbox("all"))
-        canvas.itemconfig(inner_id, width=canvas.winfo_width())
-
-    inner.bind("<Configure>", on_cfg)
-    canvas.bind("<Configure>", lambda e: canvas.itemconfig(inner_id, width=e.width))
-    return canvas, inner
-
-# ── App ───────────────────────────────────────────────────────────────────────
-
-class SoniqueApp:
+class SoniqueProDB:
     def __init__(self):
-        self.history = load_history()
-        self.api_key = os.environ.get("GEMINI_API_KEY", "")
-        self.tray    = None
-        self._last_np     = None
-        self._polling     = False
-        self._load_settings()
+        # check_same_thread=False allows Tkinter background threads to query the DB
+        self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.create_tables()
+        
+        # Auto-seed the database if it's empty on first launch
+        c = self.conn.cursor()
+        c.execute("SELECT COUNT(*) FROM songs")
+        if c.fetchone()[0] == 0:
+            self.seed_demo()
 
-    def _load_settings(self):
-        if SETTINGS_FILE.exists():
-            try:
-                s = json.loads(SETTINGS_FILE.read_text())
-                if s.get("api_key"):
-                    self.api_key = s["api_key"]
-                if s.get("extra_browsers"):
-                    for b in s["extra_browsers"]:
-                        BROWSER_PROCS.add(b.lower().strip())
-            except Exception:
-                pass
+    
+    # DATABASE
+    
+    def create_tables(self):
+        c = self.conn.cursor()
 
-    def _save_settings(self, extra_browsers=None):
-        data = {"api_key": self.api_key}
-        if extra_browsers is not None:
-            data["extra_browsers"] = extra_browsers
-        elif SETTINGS_FILE.exists():
-            try:
-                prev = json.loads(SETTINGS_FILE.read_text())
-                if prev.get("extra_browsers"):
-                    data["extra_browsers"] = prev["extra_browsers"]
-            except Exception:
-                pass
-        SETTINGS_FILE.write_text(json.dumps(data))
-
-    # ── Tray ──────────────────────────────────────────────────────────────────
-
-    def run(self):
-        self._start_polling()
-        icon_img = make_icon_image()
-        menu = pystray.Menu(
-            pystray.MenuItem("Sonique", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Now Playing",     lambda: self._open("nowplaying")),
-            pystray.MenuItem("Log a song",      lambda: self._open("add")),
-            pystray.MenuItem("History",         lambda: self._open("history")),
-            pystray.MenuItem("Recommendations", lambda: self._open("reco")),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Settings",        lambda: self._open("settings")),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",            self._quit),
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS songs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            song TEXT,
+            artist TEXT,
+            genre TEXT,
+            mood TEXT,
+            bpm INTEGER,
+            energy INTEGER,
+            year INTEGER,
+            popularity INTEGER
         )
-        self.tray = pystray.Icon("Sonique", icon_img, "Sonique — Music AI", menu)
-        self.tray.run()
+        """)
 
-    def _open(self, tab):
-        threading.Thread(target=lambda: self._show_window(tab), daemon=True).start()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            song TEXT,
+            artist TEXT,
+            mins REAL,
+            ts TEXT
+        )
+        """)
 
-    def _quit(self):
-        self._polling = False
-        if self.tray:
-            self.tray.stop()
-        os._exit(0)
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_song
+        ON songs(song,artist)
+        """)
 
-    # ── Polling ───────────────────────────────────────────────────────────────
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_genre
+        ON songs(genre)
+        """)
 
-    def _start_polling(self):
-        if not HAS_WIN32:
-            return
-        self._polling = True
-        threading.Thread(target=self._poll_loop, daemon=True).start()
+        self.conn.commit()
 
-    def _poll_loop(self):
-        while self._polling:
-            np = detect_now_playing()
-            if np and np.get("song") != (self._last_np or {}).get("song"):
-                self._last_np = np
-                if self.tray:
-                    try:
-                        tip = f"{np['song']}"
-                        if np.get("artist"):
-                            tip += f" - {np['artist']}"
-                        self.tray.title = tip
-                    except Exception:
-                        pass
-            time.sleep(4)
+    
+    # ADD SONG
+    
+    def add_song(self, song, artist, genre, mood, bpm, energy, year, popularity):
+        self.conn.execute("""
+        INSERT INTO songs(
+            song,artist,genre,mood,bpm,energy,year,popularity
+        )
+        VALUES(?,?,?,?,?,?,?,?)
+        """, (
+            song, artist, genre, mood,
+            bpm, energy, year, popularity
+        ))
+        self.conn.commit()
 
-    # ── Window ────────────────────────────────────────────────────────────────
+    
+    # DEMO DATA aka (PLAYLIST)
+   
+    def seed_demo(self):
+        demo = [
+            # Playlist of 45 iconic tracks across genres and eras with metadata for testing
+            ("Blinding Lights", "The Weeknd", "Pop", "night", 171, 9, 2020, 98),
+            ("Starboy", "The Weeknd", "Pop", "dark", 186, 8, 2016, 95),
+            ("Save Your Tears", "The Weeknd", "Pop", "sad", 118, 7, 2021, 95),
+            ("Levitating", "Dua Lipa", "Pop", "party", 103, 8, 2020, 96),
+            ("Don't Start Now", "Dua Lipa", "Pop", "dance", 124, 9, 2019, 94),
+            ("As It Was", "Harry Styles", "Pop", "nostalgic", 174, 6, 2022, 95),
+            ("Stay", "Kid Laroi", "Pop", "youthful", 170, 8, 2021, 93),
+            ("Heat Waves", "Glass Animals", "Indie", "dreamy", 81, 5, 2021, 93),
+            ("Sunflower", "Post Malone", "HipHop", "happy", 90, 6, 2019, 96),
+            ("Passionfruit", "Drake", "R&B", "late night", 112, 5, 2017, 92),
+            ("One Dance", "Drake", "HipHop", "summer", 104, 7, 2016, 96),
 
-    def _show_window(self, tab="nowplaying"):
-        root = tk.Tk()
-        root.title("Sonique")
-        root.configure(bg=BG)
-        root.resizable(True, True)
-        try:
-            root.iconbitmap(default="")
-        except Exception:
-            pass
-        w, h = 720, 600
-        x = (root.winfo_screenwidth()  - w) // 2
-        y = (root.winfo_screenheight() - h) // 2
-        root.geometry(f"{w}x{h}+{x}+{y}")
-        self._build_ui(root, tab)
-        root.mainloop()
+            ("Bad Habit", "Steve Lacy", "R&B", "cool", 84, 5, 2022, 92),
+            ("Redbone", "Childish Gambino", "Soul", "funky", 160, 6, 2016, 91),
+            ("Midnight City", "M83", "Electronic", "night", 105, 7, 2011, 90),
+            ("Electric Feel", "MGMT", "Indie", "party", 98, 7, 2007, 90),
+            ("Cruel Summer", "Taylor Swift", "Pop", "upbeat", 170, 8, 2019, 97),
+            ("Anti-Hero", "Taylor Swift", "Pop", "introspective", 97, 6, 2022, 96),
+            ("Die For You", "The Weeknd", "Pop", "romantic", 133, 6, 2016, 95),
+            ("Watermelon Sugar", "Harry Styles", "Pop", "summer", 95, 8, 2019, 94),
+            ("About Damn Time", "Lizzo", "Pop", "party", 109, 8, 2022, 92),
 
-    def _build_ui(self, root, initial_tab):
-        hdr = tk.Frame(root, bg=ACCENT, height=52)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        tk.Label(hdr, text="Sonique", font=("Georgia", 17, "italic"),
-                 bg=ACCENT, fg="white").pack(side="left", padx=18, pady=10)
-        tk.Label(hdr, text="AI Music Taste Engine", font=("Segoe UI", 10),
-                 bg=ACCENT, fg="#A8E8D0").pack(side="left", pady=14)
-        tk.Button(hdr, text="Exit", font=("Segoe UI", 10),
-                  bg=DARK, fg="white", relief="flat",
-                  padx=14, pady=6, cursor="hand2",
-                  activebackground="#0A3D2E", activeforeground="white",
-                  command=self._quit).pack(side="right", padx=14, pady=10)
+            ("Peaches", "Justin Bieber", "Pop", "chill", 90, 7, 2021, 91),
+            ("Bad Guy", "Billie Eilish", "Pop", "dark", 135, 6, 2019, 95),
+            ("Happier Than Ever", "Billie Eilish", "Pop", "angry", 81, 5, 2021, 93),
+            ("Good Days", "SZA", "R&B", "chill", 121, 5, 2020, 93),
+            ("Kill Bill", "SZA", "R&B", "angry", 89, 7, 2022, 95),
+            ("Pink + White", "Frank Ocean", "R&B", "dreamy", 160, 5, 2016, 92),
+            ("Nights", "Frank Ocean", "R&B", "late night", 90, 6, 2016, 93),
+            ("Creepin'", "Metro Boomin", "HipHop", "dark", 98, 6, 2022, 94),
+            ("rockstar", "Post Malone", "HipHop", "dark", 90, 6, 2017, 95),
 
-        tab_frame = tk.Frame(root, bg=BG)
-        tab_frame.pack(fill="x")
+            ("Circles", "Post Malone", "Pop", "nostalgic", 120, 7, 2019, 96),
+            ("Lucid Dreams", "Juice WRLD", "HipHop", "sad", 84, 6, 2018, 94),
+            ("Industry Baby", "Lil Nas X", "HipHop", "energetic", 150, 9, 2021, 94),
+            ("Montero", "Lil Nas X", "Pop", "dark", 136, 7, 2021, 93),
+            ("The Less I Know The Better", "Tame Impala", "Indie", "funky", 117, 7, 2015, 96),
+            ("Do I Wanna Know?", "Arctic Monkeys", "Rock", "cool", 85, 6, 2013, 94),
+            ("Take Me To Church", "Hozier", "Indie", "dark", 129, 6, 2013, 91),
+            ("Somebody That I Used To Know", "Gotye", "Indie", "sad", 129, 5, 2011, 90),
+            ("Smells Like Teen Spirit", "Nirvana", "Rock", "energetic", 117, 9, 1991, 92),
 
-        TABS = [
-            ("Now Playing", "nowplaying"),
-            ("Log Song",    "add"),
-            ("History",     "history"),
-            ("Recs",        "reco"),
-            ("Settings",    "settings"),
+            ("Mr. Brightside", "The Killers", "Rock", "party", 148, 9, 2003, 95),
+            ("Dreams", "Fleetwood Mac", "Rock", "chill", 120, 5, 1977, 92),
+            ("Bohemian Rhapsody", "Queen", "Rock", "epic", 72, 6, 1975, 96),
+            ("Get Lucky", "Daft Punk", "Electronic", "dance", 116, 8, 2013, 93),
+            ("Closer", "The Chainsmokers", "Electronic", "party", 95, 7, 2016, 94),
+            ("Wake Me Up", "Avicii", "Electronic", "upbeat", 124, 9, 2013, 95),
+            ("Titanium", "David Guetta", "Electronic", "energetic", 126, 9, 2011, 91),
         ]
-        tab_btns     = {}
-        content_area = tk.Frame(root, bg=BG)
-        content_area.pack(fill="both", expand=True)
-        frames = {}
 
-        def switch(name):
-            for frm in frames.values():
-                frm.pack_forget()
-            frames[name].pack(fill="both", expand=True, padx=18, pady=14)
-            for n, b in tab_btns.items():
-                b.configure(bg=ACCENT if n == name else BG,
-                            fg="white"  if n == name else MUTED)
-            if name == "history" and hasattr(frames["history"], "_refresh"):
-                frames["history"]._refresh()
+        for d in demo:
+            self.add_song(*d)
 
-        for label, name in TABS:
-            b = tk.Button(tab_frame, text=label, font=("Segoe UI", 10),
-                          bg=BG, fg=MUTED, relief="flat", bd=0,
-                          padx=14, pady=8, cursor="hand2",
-                          command=lambda n=name: switch(n))
-            b.pack(side="left")
-            tab_btns[name] = b
+    
+    # HELPERS
+   
+    def clamp(self, n, low, high):
+        return max(low, min(high, n))
 
-        tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
+    def score_distance(self, a, b, max_diff):
+        diff = abs(a - b)
+        return max(0, 1 - (diff / max_diff))
 
-        frames["nowplaying"] = self._build_nowplaying(content_area)
-        frames["add"]        = self._build_add(content_area)
-        frames["history"]    = self._build_history(content_area)
-        frames["reco"]       = self._build_reco(content_area)
-        frames["settings"]   = self._build_settings(content_area)
+    
+    # FIND TRACK
+    
+    def get_track(self, song, artist=""):
+        c = self.conn.cursor()
 
-        switch(initial_tab)
+        if artist:
+            c.execute("""
+            SELECT * FROM songs
+            WHERE lower(song)=lower(?)
+            AND lower(artist)=lower(?)
+            LIMIT 1
+            """, (song, artist))
+        else:
+            c.execute("""
+            SELECT * FROM songs
+            WHERE lower(song)=lower(?)
+            LIMIT 1
+            """, (song,))
 
-    # ── Now Playing tab ───────────────────────────────────────────────────────
+        return c.fetchone()
 
-    def _build_nowplaying(self, parent):
-        f = tk.Frame(parent, bg=BG)
+    
+    # MAIN RECOMMENDER (Now Playing)
+   
+    def recommend_next(self, song, artist="", limit=5):
+        seed = self.get_track(song, artist)
 
-        # Detection card
-        det_card = tk.Frame(f, bg=SURFACE, highlightthickness=1,
-                            highlightbackground=BORDER)
-        det_card.pack(fill="x", pady=(0, 12))
+        if not seed:
+            return self.popular(limit)
 
-        det_top = tk.Frame(det_card, bg=SURFACE)
-        det_top.pack(fill="x", padx=14, pady=(10, 4))
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM songs")
+        rows = c.fetchall()
 
-        source_var = tk.StringVar(value="Scanning for music…")
-        song_var   = tk.StringVar(value="")
-        artist_var = tk.StringVar(value="")
+        scored = []
 
-        tk.Label(det_top, textvariable=source_var,
-                 font=("Segoe UI", 9), bg=SURFACE, fg=MUTED).pack(side="left")
+        for row in rows:
+            if row["song"] == seed["song"] and row["artist"] == seed["artist"]:
+                continue
 
-        refresh_btn = tk.Button(det_top, text="Refresh",
-                                font=("Segoe UI", 9), bg=SURFACE, fg=ACCENT,
-                                relief="flat", cursor="hand2", bd=0)
-        refresh_btn.pack(side="right")
+            score = 0
 
-        tk.Label(det_card, textvariable=artist_var,
-                 font=("Georgia", 15, "italic", "bold"),
-                 bg=SURFACE, fg=TEXT, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
-        tk.Label(det_card, textvariable=song_var,
-                 font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
-                 anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+            # same genre
+            if row["genre"] == seed["genre"]:
+                score += 25
 
-        if not HAS_WIN32:
-            tk.Label(det_card,
-                     text="Auto-detection needs pywin32 + psutil:  py -m pip install pywin32 psutil",
-                     font=("Segoe UI", 9), bg=SURFACE, fg=AMBER,
-                     anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+            # same mood
+            if row["mood"] == seed["mood"]:
+                score += 18
 
-        # Manual entry
-        man_frame = tk.Frame(f, bg=BG)
-        man_frame.pack(fill="x", pady=(0, 10))
+            # BPM closeness
+            score += self.score_distance(
+                row["bpm"], seed["bpm"], 80
+            ) * 20
 
-        tk.Label(man_frame, text="Or enter a song manually:",
-                 font=("Segoe UI", 9), bg=BG, fg=MUTED).pack(anchor="w")
+            # energy closeness
+            score += self.score_distance(
+                row["energy"], seed["energy"], 10
+            ) * 15
 
-        man_row = tk.Frame(man_frame, bg=BG)
-        man_row.pack(fill="x", pady=(4, 0))
+            # era closeness
+            score += self.score_distance(
+                row["year"], seed["year"], 20
+            ) * 10
 
-        man_song_var   = tk.StringVar()
-        man_artist_var = tk.StringVar()
+            # same artist boost
+            if row["artist"] == seed["artist"]:
+                score += 22
 
-        tk.Label(man_row, text="Song", font=("Segoe UI", 9),
-                 bg=BG, fg=MUTED, width=5).pack(side="left")
-        tk.Entry(man_row, textvariable=man_song_var, font=("Segoe UI", 10),
-                 bg=SURFACE, fg=TEXT, relief="flat",
-                 highlightthickness=1, highlightbackground=BORDER,
-                 highlightcolor=ACCENT, width=24
-                 ).pack(side="left", ipady=5, padx=(2, 10))
-        tk.Label(man_row, text="Artist", font=("Segoe UI", 9),
-                 bg=BG, fg=MUTED).pack(side="left")
-        tk.Entry(man_row, textvariable=man_artist_var, font=("Segoe UI", 10),
-                 bg=SURFACE, fg=TEXT, relief="flat",
-                 highlightthickness=1, highlightbackground=BORDER,
-                 highlightcolor=ACCENT, width=22
-                 ).pack(side="left", ipady=5, padx=(4, 0))
+            # popularity
+            score += row["popularity"] / 10
 
-        # Controls row
-        ctrl = tk.Frame(f, bg=BG)
-        ctrl.pack(fill="x", pady=(0, 10))
+            scored.append((score, row))
 
-        count_var = tk.StringVar(value="5")
-        tk.Label(ctrl, text="Count:", font=("Segoe UI", 10),
-                 bg=BG, fg=MUTED).pack(side="left")
-        ttk.Spinbox(ctrl, from_=1, to=10, textvariable=count_var,
-                    width=4, font=("Segoe UI", 10)).pack(side="left", padx=(4, 14))
+        scored.sort(reverse=True, key=lambda x: x[0])
 
-        get_btn = tk.Button(ctrl,
-                            text="Get recommendations for this song",
-                            font=("Segoe UI", 10, "bold"),
-                            bg=ACCENT, fg="white", relief="flat",
-                            padx=14, pady=6, cursor="hand2",
-                            activebackground=DARK, activeforeground="white")
-        get_btn.pack(side="left")
-
-        # Fixed-height scroll area so log row stays visible
-        scroll_frame = tk.Frame(f, bg=BG, height=180)
-        scroll_frame.pack(fill="x")
-        scroll_frame.pack_propagate(False)
-        canvas_np = tk.Canvas(scroll_frame, bg=BG, highlightthickness=0)
-        vsb_np    = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas_np.yview)
-        canvas_np.configure(yscrollcommand=vsb_np.set)
-        canvas_np.pack(side="left", fill="both", expand=True)
-        vsb_np.pack(side="right", fill="y")
-        inner    = tk.Frame(canvas_np, bg=BG)
-        inner_id = canvas_np.create_window((0, 0), window=inner, anchor="nw")
-
-        def _np_cfg(event):
-            canvas_np.configure(scrollregion=canvas_np.bbox("all"))
-            canvas_np.itemconfig(inner_id, width=canvas_np.winfo_width())
-        inner.bind("<Configure>", _np_cfg)
-        canvas_np.bind("<Configure>", lambda e: canvas_np.itemconfig(inner_id, width=e.width))
-
-        # Scrollable error/status box
-        err_frame = tk.Frame(f, bg=BG)
-        err_frame.pack(fill="x", pady=(4, 0))
-        err_box = tk.Text(err_frame, font=("Segoe UI", 9), bg=BG, fg=MUTED,
-                          relief="flat", wrap="word", height=4,
-                          state="disabled", bd=0)
-        err_sb = ttk.Scrollbar(err_frame, orient="vertical", command=err_box.yview)
-        err_box.configure(yscrollcommand=err_sb.set)
-        err_box.pack(side="left", fill="x", expand=True)
-        # Only show scrollbar when there's content
-        err_sb_visible = [False]
-
-        def set_status(msg, color=MUTED):
-            err_box.configure(state="normal")
-            err_box.delete("1.0", "end")
-            err_box.insert("end", msg)
-            err_box.configure(state="disabled", fg=color)
-            # Show scrollbar for long messages
-            if msg.count("\n") > 2:
-                err_sb.pack(side="right", fill="y")
-            else:
-                err_sb.pack_forget()
-
-        # Shim so existing code using status_var.set() still works
-        class _StatusVar:
-            def set(self_, msg): set_status(msg)
-            def get(self_): return err_box.get("1.0", "end").strip()
-        status_var = _StatusVar()
-
-        current_np = {"data": None}
-
-        def refresh_np():
-            np = self._last_np if HAS_WIN32 else None
-            if np:
-                source_var.set(f"Now playing via {np['source']}")
-                song_var.set(np["song"])
-                artist_var.set(np.get("artist", ""))
-                current_np["data"] = np
-            else:
-                source_var.set("" if HAS_WIN32 else "Install pywin32 for auto-detection")
-                song_var.set("")
-                artist_var.set("")
-                current_np["data"] = None
-
-        refresh_btn.configure(command=refresh_np)
-
-        def _auto():
-            refresh_np()
-            f.after(4000, _auto)
-        f.after(300, _auto)
-
-        def fetch():
-            man_song = man_song_var.get().strip()
-            if man_song:
-                np = {"source": "manual entry",
-                      "song": man_song,
-                      "artist": man_artist_var.get().strip()}
-            elif current_np["data"]:
-                np = current_np["data"]
-            else:
-                status_var.set("Nothing is playing and no song was entered manually.")
-                return
-
-            seed = f'"{np["song"]}"'
-            if np.get("artist"):
-                seed += f' by {np["artist"]}'
-
-            get_btn.configure(state="disabled", text="Fetching…")
-            status_var.set(f"Finding what plays well after {seed}…")
-            for w in inner.winfo_children():
-                w.destroy()
-
-            def worker():
-                try:
-                    recos = get_now_playing_recommendations(
-                        np, self.history, int(count_var.get() or 5), self.api_key
-                    )
-                    inner.after(0, lambda r=recos: render_reco_cards(inner, r, wrap=640))
-                    inner.after(0, lambda r=recos: status_var.set(
-                        f"Showing {len(r)} songs that go well after {seed}"))
-                except Exception as e:
-                    import traceback
-                    err_msg = traceback.format_exc()
-                    inner.after(0, lambda msg=err_msg: status_var.set(f"Error: {msg}"))
-                finally:
-                    inner.after(0, lambda: get_btn.configure(
-                        state="normal",
-                        text="Get recommendations for this song"))
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        # ── Log current song ──────────────────────────────────────────────────
-
-        log_frame = tk.Frame(f, bg=BG)
-        log_frame.pack(fill="x", pady=(0, 6))
-
-        tk.Frame(log_frame, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
-
-        log_row = tk.Frame(log_frame, bg=BG)
-        log_row.pack(fill="x")
-
-        tk.Label(log_row, text="Log this song:", font=("Segoe UI", 9),
-                 bg=BG, fg=MUTED).pack(side="left")
-
-        log_mins_var = tk.StringVar(value="3")
-        tk.Label(log_row, text="  Minutes:", font=("Segoe UI", 9),
-                 bg=BG, fg=MUTED).pack(side="left")
-        tk.Entry(log_row, textvariable=log_mins_var, width=5,
-                 font=("Segoe UI", 10), bg=SURFACE, fg=TEXT,
-                 relief="flat", highlightthickness=1,
-                 highlightbackground=BORDER, highlightcolor=ACCENT
-                 ).pack(side="left", ipady=4, padx=(4, 12))
-
-        tk.Label(log_row, text="Mood:", font=("Segoe UI", 9),
-                 bg=BG, fg=MUTED).pack(side="left")
-        log_mood_var = tk.StringVar()
-        tk.Entry(log_row, textvariable=log_mood_var, width=14,
-                 font=("Segoe UI", 10), bg=SURFACE, fg=TEXT,
-                 relief="flat", highlightthickness=1,
-                 highlightbackground=BORDER, highlightcolor=ACCENT
-                 ).pack(side="left", ipady=4, padx=(4, 12))
-
-        log_status_var = tk.StringVar()
-        tk.Label(log_frame, textvariable=log_status_var,
-                 font=("Segoe UI", 9), bg=BG, fg=ACCENT).pack(anchor="w", pady=(4, 0))
-
-        def log_current():
-            man_song = man_song_var.get().strip()
-            if man_song:
-                np = {"source": "manual entry",
-                      "song": man_song,
-                      "artist": man_artist_var.get().strip()}
-            elif current_np["data"]:
-                np = current_np["data"]
-            else:
-                log_status_var.set("Nothing is playing to log.")
-                return
-            try:
-                mins = float(log_mins_var.get())
-                assert mins > 0
-            except Exception:
-                log_status_var.set("Enter a valid number of minutes.")
-                return
-            self.history.insert(0, {
-                "id":     int(time.time() * 1000),
-                "song":   np["song"],
-                "artist": np.get("artist", ""),
-                "genre":  "",
-                "mins":   mins,
-                "mood":   log_mood_var.get().strip(),
-                "ts":     datetime.now().isoformat(),
+        results = []
+        for score, row in scored[:limit]:
+            results.append({
+                "song": row["song"],
+                "artist": row["artist"],
+                "genre": row["genre"],
+                "match": f"{int(self.clamp(score,70,99))}%",
+                "why": (
+                    f"Matches {seed['song']} in "
+                    f"{row['genre']} vibe, BPM, energy and mood."
+                ),
+                "tags": [
+                    row["genre"].lower(),
+                    row["mood"].lower(),
+                    f"{row['bpm']} BPM"
+                ]
             })
-            save_history(self.history)
-            log_mood_var.set("")
-            song_lbl = np["song"]
-            artist_lbl = np.get("artist", "")
-            msg = f"\u2713  Logged {round(mins)} min of \u201c{song_lbl}\u201d"
-            if artist_lbl:
-                msg += f" by {artist_lbl}"
-            log_status_var.set(msg)
-        tk.Button(log_row, text="Log it",
-                  font=("Segoe UI", 10, "bold"),
-                  bg=DARK, fg="white", relief="flat",
-                  padx=12, pady=5, cursor="hand2",
-                  activebackground="#0A3D2E", activeforeground="white",
-                  command=log_current).pack(side="left")
 
-        get_btn.configure(command=fetch)
-        return f
+        return results
 
-    # ── Add tab ───────────────────────────────────────────────────────────────
+    
+    # HISTORY AI (Recs Tab)
 
-    def _build_add(self, parent):
-        f = tk.Frame(parent, bg=BG)
+    def recommend_from_history(self, history, mood_filter="", limit=5):
+        if not history:
+            return self.popular(limit)
 
-        song_var   = tk.StringVar()
-        artist_var = tk.StringVar()
-        genre_var  = tk.StringVar()
-        mins_var   = tk.StringVar()
-        mood_var   = tk.StringVar()
+        # Extract ALL unique artists and genres from the user's history
+        artists = list(set([h.get("artist") for h in history if h.get("artist")]))
+        genres = list(set([h.get("genre") for h in history if h.get("genre")]))
 
-        def lbl(c, t):
-            tk.Label(c, text=t, font=("Segoe UI", 9), fg=MUTED, bg=BG).pack(anchor="w")
+        # Fallback if history objects are somehow completely empty
+        if not artists and not genres:
+            return self.popular(limit)
 
-        def ent(c, v):
-            tk.Entry(c, textvariable=v, font=("Segoe UI", 11),
-                     bg=SURFACE, fg=TEXT, relief="flat",
-                     highlightthickness=1, highlightbackground=BORDER,
-                     highlightcolor=ACCENT).pack(fill="x", ipady=6, pady=(2, 10))
+        c = self.conn.cursor()
+        
+        # Build dynamic IN clauses to search the whole database for matches
+        artist_marks = ",".join("?" * len(artists)) if artists else "''"
+        genre_marks = ",".join("?" * len(genres)) if genres else "''"
+        
+        query = f"SELECT * FROM songs WHERE (artist IN ({artist_marks}) OR genre IN ({genre_marks}))"
+        params = artists + genres
+        
+        if mood_filter:
+            query += " AND lower(mood)=lower(?)"
+            params.append(mood_filter.strip())
+            
+        query += " ORDER BY popularity DESC LIMIT ?"
+        params.append(limit)
 
-        r1 = tk.Frame(f, bg=BG); r1.pack(fill="x")
-        L  = tk.Frame(r1, bg=BG); L.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        R  = tk.Frame(r1, bg=BG); R.pack(side="left", fill="x", expand=True)
-        lbl(L, "Song title"); ent(L, song_var)
-        lbl(R, "Artist");     ent(R, artist_var)
+        c.execute(query, params)
+        rows = c.fetchall()
+        
+        if not rows and mood_filter:
+            fallback_query = f"SELECT * FROM songs WHERE (artist IN ({artist_marks}) OR genre IN ({genre_marks})) ORDER BY popularity DESC LIMIT ?"
+            c.execute(fallback_query, artists + genres + [limit])
+            rows = c.fetchall()
 
-        r2 = tk.Frame(f, bg=BG); r2.pack(fill="x")
-        GL = tk.Frame(r2, bg=BG); GL.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ML = tk.Frame(r2, bg=BG); ML.pack(side="left", fill="x", expand=True)
-        lbl(GL, "Genre")
-        ttk.Combobox(GL, textvariable=genre_var, values=GENRES,
-                     state="readonly", font=("Segoe UI", 11)
-                     ).pack(fill="x", ipady=4, pady=(2, 10))
-        lbl(ML, "Minutes listened"); ent(ML, mins_var)
-        lbl(f, "Mood / vibe (optional)"); ent(f, mood_var)
+        # Format the matches we found
+        results = [
+            {
+                "song": r["song"],
+                "artist": r["artist"],
+                "genre": r["genre"],
+                "match": "95%",
+                "why": f"Based on your recent listening history.",
+                "tags": [r["genre"].lower(), r["mood"].lower(), "history"]
+            }
+            for r in rows
+        ]
 
-        status_var = tk.StringVar()
-        status_lbl = tk.Label(f, textvariable=status_var, font=("Segoe UI", 10),
-                              bg=BG, fg=ACCENT)
-        status_lbl.pack(anchor="w", pady=(0, 8))
+        if len(results) < limit:
+            current_songs = [r["song"] for r in results]
+            
+            # Fetch extra popular songs to fill the gaps
+            pop_songs = self.popular(limit + len(results)) 
+            for p in pop_songs:
+                if p["song"] not in current_songs:
+                    p["why"] = "Recommended popular track to expand your taste."
+                    p["tags"] = [p["genre"].lower(), "popular"]
+                    results.append(p)
+                if len(results) == limit:
+                    break
 
-        def log_song():
-            song   = song_var.get().strip()
-            artist = artist_var.get().strip()
-            if not song or not artist:
-                status_var.set("Please enter a song title and artist.")
-                status_lbl.configure(fg=AMBER); return
-            try:
-                mins = float(mins_var.get()); assert mins > 0
-            except Exception:
-                status_var.set("Enter a valid number of minutes.")
-                status_lbl.configure(fg=AMBER); return
-            self.history.insert(0, {
-                "id": int(time.time()*1000), "song": song, "artist": artist,
-                "genre": genre_var.get().strip(), "mins": mins,
-                "mood": mood_var.get().strip(), "ts": datetime.now().isoformat(),
-            })
-            save_history(self.history)
-            for v in (song_var, artist_var, genre_var, mins_var, mood_var):
-                v.set("")
-            status_var.set(f'Logged {round(mins)} min of "{song}" by {artist}')
-            status_lbl.configure(fg=ACCENT)
+        return results
 
-        tk.Button(f, text="Log listening session",
-                  font=("Segoe UI", 11, "bold"),
-                  bg=ACCENT, fg="white", relief="flat",
-                  padx=20, pady=9, cursor="hand2",
-                  activebackground=DARK, activeforeground="white",
-                  command=log_song).pack(anchor="w")
-        return f
+    
+    # FALLBACK
+    
+    def popular(self, limit=5):
+        c = self.conn.cursor()
+        c.execute("""
+        SELECT * FROM songs
+        ORDER BY popularity DESC
+        LIMIT ?
+        """, (limit,))
+        rows = c.fetchall()
 
-    # ── History tab ───────────────────────────────────────────────────────────
-
-    def _build_history(self, parent):
-        f = tk.Frame(parent, bg=BG)
-
-        stats_frame = tk.Frame(f, bg=BG)
-        stats_frame.pack(fill="x", pady=(0, 12))
-
-        self._stat_tracks = tk.StringVar()
-        self._stat_mins   = tk.StringVar()
-        self._stat_genre  = tk.StringVar()
-
-        for var, label in [
-            (self._stat_tracks, "songs logged"),
-            (self._stat_mins,   "minutes total"),
-            (self._stat_genre,  "top genre"),
-        ]:
-            card = tk.Frame(stats_frame, bg=SURFACE,
-                            highlightthickness=1, highlightbackground=BORDER)
-            card.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            tk.Label(card, textvariable=var, font=("Segoe UI", 20, "bold"),
-                     bg=SURFACE, fg=TEXT).pack(padx=14, pady=(10, 2))
-            tk.Label(card, text=label, font=("Segoe UI", 9),
-                     bg=SURFACE, fg=MUTED).pack(padx=14, pady=(0, 10))
-
-        tbl = tk.Frame(f, bg=BG)
-        tbl.pack(fill="both", expand=True)
-
-        cols = ("Song", "Artist", "Genre", "Mood", "Min", "Date")
-        tree = ttk.Treeview(tbl, columns=cols, show="headings", height=10)
-        for col, w in zip(cols, [180, 150, 120, 100, 50, 80]):
-            tree.heading(col, text=col)
-            tree.column(col, width=w, anchor="w")
-        sb = ttk.Scrollbar(tbl, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=sb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        btn_row = tk.Frame(f, bg=BG)
-        btn_row.pack(fill="x", pady=(10, 0))
-
-        status_var = tk.StringVar()
-        tk.Label(btn_row, textvariable=status_var, font=("Segoe UI", 10),
-                 bg=BG, fg=RED).pack(side="right", padx=4)
-
-        def delete_selected():
-            sel = tree.selection()
-            if not sel:
-                status_var.set("Select a row first."); return
-            idx     = tree.index(sel[0])
-            removed = self.history.pop(idx)
-            save_history(self.history)
-            status_var.set(f'Deleted "{removed["song"]}"')
-            refresh()
-
-        tk.Button(btn_row, text="Delete selected entry",
-                  font=("Segoe UI", 10), bg=SURFACE, fg=RED, relief="flat",
-                  highlightthickness=1, highlightbackground="#F09595",
-                  padx=12, pady=6, cursor="hand2",
-                  activebackground=RED_BG,
-                  command=delete_selected).pack(side="left")
-
-        def refresh():
-            for row in tree.get_children():
-                tree.delete(row)
-            total     = round(sum(e["mins"] for e in self.history))
-            genre_map = {}
-            for e in self.history:
-                if e.get("genre"):
-                    genre_map[e["genre"]] = genre_map.get(e["genre"], 0) + e["mins"]
-            top = max(genre_map, key=genre_map.get) if genre_map else "—"
-            self._stat_tracks.set(str(len(self.history)))
-            self._stat_mins.set(str(total))
-            self._stat_genre.set(top.split("/")[0].strip() if "/" in top else top)
-            for e in self.history:
-                tree.insert("", "end", values=(
-                    e["song"], e["artist"],
-                    e.get("genre", ""), e.get("mood", ""),
-                    round(e["mins"]),
-                    datetime.fromisoformat(e["ts"]).strftime("%b %d"),
-                ))
-
-        refresh()
-        f._refresh = refresh
-        return f
-
-    # ── Recs tab (history-based) ──────────────────────────────────────────────
-
-    def _build_reco(self, parent):
-        f = tk.Frame(parent, bg=BG)
-
-        ctrl = tk.Frame(f, bg=BG)
-        ctrl.pack(fill="x", pady=(0, 12))
-
-        mood_var  = tk.StringVar()
-        count_var = tk.StringVar(value="5")
-
-        tk.Label(ctrl, text="Mood filter:", font=("Segoe UI", 10),
-                 bg=BG, fg=MUTED).pack(side="left")
-        tk.Entry(ctrl, textvariable=mood_var, width=16,
-                 font=("Segoe UI", 10), bg=SURFACE, fg=TEXT,
-                 relief="flat", highlightthickness=1,
-                 highlightbackground=BORDER, highlightcolor=ACCENT
-                 ).pack(side="left", ipady=5, padx=(4, 16))
-        tk.Label(ctrl, text="Count:", font=("Segoe UI", 10),
-                 bg=BG, fg=MUTED).pack(side="left")
-        ttk.Spinbox(ctrl, from_=1, to=10, textvariable=count_var,
-                    width=4, font=("Segoe UI", 10)).pack(side="left", padx=(4, 14))
-        get_btn = tk.Button(ctrl, text="Get recommendations",
-                            font=("Segoe UI", 10, "bold"),
-                            bg=ACCENT, fg="white", relief="flat",
-                            padx=14, pady=6, cursor="hand2",
-                            activebackground=DARK, activeforeground="white")
-        get_btn.pack(side="left")
-
-        _, inner = make_scroll_canvas(f)
-
-        status_var = tk.StringVar()
-        tk.Label(f, textvariable=status_var, font=("Segoe UI", 10),
-                 bg=BG, fg=MUTED, wraplength=660).pack(anchor="w", pady=(6, 0))
-
-        def fetch():
-            if not self.history:
-                status_var.set("Log some songs first so the AI can learn your taste.")
-                return
-            get_btn.configure(state="disabled", text="Fetching…")
-            status_var.set("Analyzing your taste…")
-            for w in inner.winfo_children():
-                w.destroy()
-
-            def worker():
-                try:
-                    recos = get_recommendations(
-                        self.history, mood_var.get().strip(),
-                        int(count_var.get() or 5), self.api_key,
-                    )
-                    inner.after(0, lambda r=recos: render_reco_cards(inner, r, wrap=640))
-                    inner.after(0, lambda r=recos: status_var.set(
-                        f"Showing {len(r)} recommendations based on your history"))
-                except Exception as e:
-                    import traceback
-                    err_msg = traceback.format_exc()
-                    inner.after(0, lambda msg=err_msg: status_var.set(f"Error: {msg}"))
-                finally:
-                    inner.after(0, lambda: get_btn.configure(
-                        state="normal", text="Get recommendations"))
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        get_btn.configure(command=fetch)
-        return f
-
-    # ── Settings tab ──────────────────────────────────────────────────────────
-
-    def _debug_processes(self):
-        """Print all visible window titles and their process names to help diagnose detection."""
-        try:
-            import win32gui, win32process, psutil
-            results = []
-            def cb(hwnd, _):
-                if win32gui.IsWindowVisible(hwnd):
-                    t = win32gui.GetWindowText(hwnd).strip()
-                    if t:
-                        try:
-                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                            proc = psutil.Process(pid).name().lower()
-                        except Exception:
-                            proc = "unknown"
-                        results.append((proc, t))
-            win32gui.EnumWindows(cb, None)
-            lines = [f"{p:<30} {t}" for p, t in sorted(results)]
-            msg = "\n".join(lines[:40])
-        except Exception as e:
-            msg = str(e)
-
-        win = tk.Toplevel()
-        win.title("Process Debug")
-        win.geometry("700x420")
-        win.configure(bg=BG)
-        tk.Label(win, text="Visible windows and their process names",
-                 font=("Segoe UI", 10, "bold"), bg=BG, fg=TEXT).pack(anchor="w", padx=14, pady=(12,4))
-        tk.Label(win, text="Find your Opera/browser row and tell Sonique its process name.",
-                 font=("Segoe UI", 9), bg=BG, fg=MUTED).pack(anchor="w", padx=14, pady=(0,8))
-        txt = tk.Text(win, font=("Courier New", 9), bg=SURFACE, fg=TEXT,
-                      relief="flat", wrap="none")
-        sb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        txt.pack(side="left", fill="both", expand=True, padx=(14,0), pady=(0,14))
-        sb.pack(side="right", fill="y", pady=(0,14), padx=(0,14))
-        txt.insert("end", msg)
-        txt.configure(state="disabled")
-
-    def _build_settings(self, parent):
-        f = tk.Frame(parent, bg=BG)
-
-        tk.Label(f, text="Ollama model", font=("Segoe UI", 10),
-                 bg=BG, fg=MUTED).pack(anchor="w")
-        key_var = tk.StringVar(value=MODEL)
-        key_entry = tk.Entry(f, textvariable=key_var, font=("Segoe UI", 11),
-                             bg=SURFACE, fg=TEXT, show="", width=52,
-                             relief="flat", highlightthickness=1,
-                             highlightbackground=BORDER, highlightcolor=ACCENT)
-        key_entry.pack(anchor="w", ipady=6, pady=(2, 4), fill="x")
-
-
-
-        status_var = tk.StringVar()
-        tk.Label(f, textvariable=status_var, font=("Segoe UI", 10),
-                 bg=BG, fg=ACCENT).pack(anchor="w", pady=(0, 8))
-
-        def save_key():
-            global MODEL
-            MODEL = key_var.get().strip() or "llama3.2"
-            self._save_settings()
-            status_var.set(f"Model set to {MODEL}")
-
-        tk.Button(f, text="Save API key",
-                  font=("Segoe UI", 11, "bold"),
-                  bg=ACCENT, fg="white", relief="flat",
-                  padx=16, pady=8, cursor="hand2",
-                  activebackground=DARK, activeforeground="white",
-                  command=save_key).pack(anchor="w")
-
-        tk.Frame(f, bg=BORDER, height=1).pack(fill="x", pady=20)
-
-        tk.Label(f, text="Now Playing — supported sources",
-                 font=("Segoe UI", 10, "bold"), bg=BG, fg=TEXT).pack(anchor="w")
-        tk.Label(f,
-                 text="Spotify desktop · YouTube · SoundCloud · Tidal · Apple Music · Amazon Music · Deezer",
-                 font=("Segoe UI", 10), bg=BG, fg=MUTED,
-                 wraplength=580, justify="left").pack(anchor="w", pady=(2, 10))
-
-        win32_ok = "pywin32 installed — auto-detection active" if HAS_WIN32 \
-            else "pywin32/psutil not found — run:  py -m pip install pywin32 psutil"
-        tk.Label(f, text=win32_ok, font=("Segoe UI", 10),
-                 bg=BG, fg=ACCENT if HAS_WIN32 else AMBER).pack(anchor="w", pady=(0, 14))
-
-        tk.Label(f, text="Ollama running locally — no API key needed. Change model name above if needed.",
-                 font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w")
-        tk.Label(f, text=f"History file:  {DATA_FILE}",
-                 font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(anchor="w", pady=(4, 0))
-
-        tk.Frame(f, bg=BORDER, height=1).pack(fill="x", pady=16)
-        tk.Label(f, text="Detection not working?",
-                 font=("Segoe UI", 10, "bold"), bg=BG, fg=TEXT).pack(anchor="w")
-        tk.Label(f, text="Add your browser's process name (e.g. opera.exe) — find it using the debug button below.",
-                 font=("Segoe UI", 9), bg=BG, fg=MUTED, wraplength=560, justify="left").pack(anchor="w", pady=(2, 6))
-
-        extra_row = tk.Frame(f, bg=BG)
-        extra_row.pack(fill="x", pady=(0, 8))
-        extra_var = tk.StringVar()
-        # Pre-fill with existing custom browsers from settings
-        try:
-            s = json.loads(SETTINGS_FILE.read_text()) if SETTINGS_FILE.exists() else {}
-            extra_var.set(", ".join(s.get("extra_browsers", [])))
-        except Exception:
-            pass
-        tk.Label(extra_row, text="Extra browsers:", font=("Segoe UI", 9),
-                 bg=BG, fg=MUTED).pack(side="left")
-        tk.Entry(extra_row, textvariable=extra_var, font=("Segoe UI", 10),
-                 bg=SURFACE, fg=TEXT, relief="flat",
-                 highlightthickness=1, highlightbackground=BORDER,
-                 highlightcolor=ACCENT, width=30).pack(side="left", ipady=5, padx=(6, 8))
-
-        extra_status = tk.StringVar()
-        tk.Label(f, textvariable=extra_status, font=("Segoe UI", 9),
-                 bg=BG, fg=ACCENT).pack(anchor="w", pady=(0, 6))
-
-        def save_extra():
-            raw = extra_var.get().strip()
-            procs = [p.strip().lower() for p in raw.split(",") if p.strip()]
-            for p in procs:
-                BROWSER_PROCS.add(p)
-            self._save_settings(extra_browsers=procs)
-            extra_status.set(f"Saved — {len(procs)} custom browser(s) added")
-
-        tk.Button(f, text="Save extra browsers",
-                  font=("Segoe UI", 10), bg=SURFACE, fg=ACCENT,
-                  relief="flat", highlightthickness=1, highlightbackground=BORDER,
-                  padx=10, pady=5, cursor="hand2",
-                  command=save_extra).pack(anchor="w", pady=(0, 10))
-
-        tk.Button(f, text="Show process debug info",
-                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
-                  relief="flat", highlightthickness=1, highlightbackground=BORDER,
-                  padx=12, pady=6, cursor="hand2",
-                  command=self._debug_processes).pack(anchor="w")
-        return f
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    app = SoniqueApp()
-    # Always open the window on launch
-    tab = "settings" if not app.api_key else "nowplaying"
-    threading.Thread(target=lambda: app._show_window(tab), daemon=True).start()
-    time.sleep(0.3)
-    app.run()
+        return [
+            {
+                "song": r["song"],
+                "artist": r["artist"],
+                "genre": r["genre"],
+                "match": "90%",
+                "why": "A popular favorite across all listeners.",
+                "tags": [r["genre"].lower(), r["mood"].lower(), "popular"]
+            }
+            for r in rows
+        ]

@@ -228,21 +228,60 @@ def detect_now_playing():
 
     return None
 
-# ── Data layer ────────────────────────────────────────────────────────────────
+# ── Data layer & Database Init ────────────────────────────────────────────────
+
+import json
+import random
+from datetime import datetime, timedelta
+from sonique_database import SoniqueProDB
+
+local_db = SoniqueProDB()
+
+def generate_random_history(num_songs=4):
+    """Pulls random songs from the local SQLite database to simulate past listening."""
+    # Grab all of our available songs (our 45 demo songs)
+    pool = local_db.popular(45) 
+    
+    # Select a random subset
+    chosen = random.sample(pool, min(num_songs, len(pool)))
+    
+    history = []
+    now = datetime.now()
+    
+    for i, track in enumerate(chosen):
+        # Generate a timestamp from sometime in the last 5 hours
+        ts = (now - timedelta(minutes=random.randint(10, 650))).isoformat()
+        
+        # Extract Mood
+        mood = track["tags"][1] if len(track.get("tags", [])) > 1 else ""
+        
+        history.append({
+            "id": i + 1,
+            "song": track["song"],
+            "artist": track["artist"],
+            "genre": track["genre"],
+            "mins": random.randint(3, 20), # Random listening duration
+            "mood": mood,
+            "ts": ts
+        })
+        
+    # Sort chronologically so the newest song is at the top of the UI
+    history.sort(key=lambda x: x["ts"], reverse=True)
+    return history
 
 def load_history():
-    if DATA_FILE.exists():
-        try:
-            return json.loads(DATA_FILE.read_text())
-        except Exception:
-            return []
-    return []
-
+    """
+    TESTING MODE: 
+    By immediately returning generate_random_history(), the app will ignore 
+    the saved JSON file and give you a fresh, random user profile EVERY time you run it.
+    """
+    # Pick a random number of history tracks between 10 and 20 for the session
+    return generate_random_history(random.randint(10, 20))
 
 def save_history(history):
     DATA_FILE.write_text(json.dumps(history, indent=2))
 
-# ── AI layer ──────────────────────────────────────────────────────────────────
+# ── AI layer (Hybrid Architecture) ────────────────────────────────────────────
 
 def taste_summary(history):
     genre_map, artist_map, moods = {}, {}, []
@@ -252,11 +291,13 @@ def taste_summary(history):
         artist_map[e["artist"]] = artist_map.get(e["artist"], 0) + e["mins"]
         if e.get("mood"):
             moods.append(e["mood"].lower())
+            
     top_genres   = sorted(genre_map.items(),  key=lambda x: -x[1])[:5]
     top_artists  = sorted(artist_map.items(), key=lambda x: -x[1])[:6]
     unique_moods = list(dict.fromkeys(moods))[:6]
     recent = [f'"{e["song"]}" by {e["artist"]} ({round(e["mins"])} min)' for e in history[:15]]
     total  = round(sum(e["mins"] for e in history))
+    
     return "\n".join([
         f"Total listening time: {total} minutes",
         f"Top genres: {', '.join(f'{g} ({round(m)} min)' for g,m in top_genres) or 'mixed'}",
@@ -265,65 +306,91 @@ def taste_summary(history):
         f"Recent songs: {', '.join(recent)}",
     ])
 
-
 def _call_ai(prompt, api_key=""):
     import ollama
+    import re
+    import json
     
-    response = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        format='json'
-    )
-    
-    raw_text = response['message']['content'].strip()
-
-    # 1. Extract the clean array using Regex
-    match = re.search(r'\[.*\]', raw_text, re.DOTALL)
-    
-    if match:
-        clean_json_string = match.group(0)
-        try:
-            # 2. CONVERT the string into a Python list!
-            return json.loads(clean_json_string)
-        except json.JSONDecodeError:
-            print("Warning: Regex extracted string, but it still failed to parse.")
-            pass
-            
-    # 3. Fallback: Try to parse the raw text just in case
     try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        # If it completely fails, return an empty list so the UI doesn't crash
-        return []
+        response = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            format='json'
+        )
+        
+        raw_text = response['message']['content'].strip()
+        parsed_data = None
 
+        # Extraction
+        match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+        if match:
+            try:
+                parsed_data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
 
-def get_recommendations(history, mood_filter="", count=5, api_key=None):
-    profile   = taste_summary(history)
-    mood_line = f"\nUser's current mood: {mood_filter}" if mood_filter else ""
-    prompt = f"""You are an expert music recommendation AI.
-Based on this listener's profile, recommend {count} songs they would love.
+        # Fallback
+        if parsed_data is None:
+            # Look for an indexed dict directly if the array regex failed
+            match_dict = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if match_dict:
+                 try:
+                     parsed_data = json.loads(match_dict.group(0))
+                 except json.JSONDecodeError:
+                     pass
+                     
+            if parsed_data is None:
+                try:
+                    parsed_data = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    return [{
+                        "song": "AI Format Error", 
+                        "artist": "System", 
+                        "why": "The AI failed to generate valid JSON.",
+                        "tags": ["error", "json"]
+                    }]
 
-LISTENER PROFILE:
-{profile}{mood_line}
+        if isinstance(parsed_data, dict):
+            # Format Cases
+            for value in parsed_data.values():
+                if isinstance(value, list):
+                    return value 
+            
+            values_list = list(parsed_data.values())
+            if len(values_list) > 0 and isinstance(values_list[0], dict):
+                return values_list
+            
+            return [parsed_data]
+            
+        elif isinstance(parsed_data, list):
+            if len(parsed_data) == 0:
+                return [{"song": "AI Returned 0 Songs", "artist": "Prompt Issue", "why": "The AI understood the JSON rules but decided not to recommend any songs."}]
+            return parsed_data
+            
+        else:
+            return []
+            
+    except Exception as e:
+        return [{"song": "Ollama Connection Error", "artist": "System", "why": str(e)}]
+            
+    except Exception as e:
+        # Catch connection errors (e.g., if the Ollama server crashes)
+        return [{"song": "Ollama Connection Error", "artist": "System", "why": str(e)}]
 
-CRITICAL INSTRUCTION: You must respond ONLY with a raw, flat JSON array. Do NOT wrap the array in a dictionary or object. Do not use markdown formatting. 
+# ROUTE 1: The Recs Tab (Bypasses Ollama -> Uses SoniqueProDB)
+def get_recommendations(history, mood_filter="", count=5, api_key=""):
+    """
+    Directly routes history recommendations to the local SQLite database
+    to avoid LLM context-window hallucinations.
+    """
+    return local_db.recommend_from_history(history, mood_filter, count)
 
-EXAMPLE FORMAT:
-[
-  {{
-    "song": "Example Title",
-    "artist": "Example Artist",
-    "genre": "Pop",
-    "match": "95%",
-    "why": "Because you listen to similar artists.",
-    "tags": ["upbeat", "fun", "dance"]
-  }}
-]
-"""
-    return _call_ai(prompt, api_key)
-
-
-def get_now_playing_recommendations(now_playing, history, count=5, api_key=None):
+# ROUTE 2: The Now Playing Tab (Uses Ollama)
+def get_now_playing_recommendations(now_playing, history, count=5, api_key=""):
+    """
+    Uses the local Ollama model to dynamically infer the vibe of the live track.
+    Restored to the original declarative prompt structure that Llama 3.2 prefers.
+    """
     song   = now_playing["song"]
     artist = now_playing.get("artist", "")
     source = now_playing["source"]
@@ -334,6 +401,7 @@ def get_now_playing_recommendations(now_playing, history, count=5, api_key=None)
         history_context = f"\n\nADDITIONAL CONTEXT — listener's broader taste:\n{profile}"
 
     seed = f'"{song}"' + (f" by {artist}" if artist else "")
+    
     prompt = f"""You are an expert music recommendation AI.
 The listener is currently playing {seed} on {source}.
 Recommend {count} songs that would sound great playing next — similar vibe, energy, or style.{history_context}
@@ -345,7 +413,6 @@ Each element must have exactly these keys:
   "tags" (array of 3 short tags)
 """
     return _call_ai(prompt, api_key)
-
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 
 def make_icon_image():
@@ -363,6 +430,7 @@ def make_icon_image():
 def render_reco_cards(inner, recos, wrap=600):
     for w in inner.winfo_children():
         w.destroy()
+        
     for i, r in enumerate(recos):
         border = ACCENT if i == 0 else BORDER
         card   = tk.Frame(inner, bg=SURFACE,
@@ -372,26 +440,31 @@ def render_reco_cards(inner, recos, wrap=600):
 
         top = tk.Frame(card, bg=SURFACE)
         top.pack(fill="x", padx=14, pady=(12, 4))
-        tk.Label(top, text=("✦ " if i == 0 else f"#{i+1}  ") + r["song"],
+        
+        # Safely render the song title using .get() to prevent hard crashes if a key is missing
+        tk.Label(top, text=("✦ " if i == 0 else f"#{i+1}  ") + r.get("song", "Unknown Title"),
                  font=("Georgia", 13, "italic", "bold"),
                  bg=SURFACE, fg=ACCENT if i == 0 else TEXT,
                  anchor="w").pack(side="left")
+                 
         tk.Label(top, text=r.get("match", ""),
                  font=("Segoe UI", 10, "bold"),
                  bg=SURFACE, fg=ACCENT).pack(side="right")
 
-        tk.Label(card, text=f"{r['artist']}  ·  {r.get('genre','')}",
+        tk.Label(card, text=f"{r.get('artist', 'Unknown')}  ·  {r.get('genre','')}",
                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
                  anchor="w").pack(fill="x", padx=14, pady=(0, 6))
+                 
         tk.Label(card, text="  ".join(f"#{t}" for t in r.get("tags", [])),
                  font=("Segoe UI", 9), bg=SURFACE, fg=MUTED,
                  anchor="w").pack(fill="x", padx=14)
+                 
         tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
+        
         tk.Label(card, text=r.get("why", ""),
                  font=("Segoe UI", 10), bg=SURFACE, fg=MUTED,
                  wraplength=wrap, justify="left",
                  anchor="w").pack(fill="x", padx=14, pady=(0, 14))
-
 
 def make_scroll_canvas(parent):
     """Return (canvas, inner_frame) with auto-scroll setup."""
