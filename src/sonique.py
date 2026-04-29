@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path 
 import sqlite3
 
+from agent import save_history
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 missing = []
 try:
