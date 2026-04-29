@@ -85,12 +85,12 @@ AMBER   = "#854F0B"
 # Spotify:        "Song - Artist"  (bare, no suffix — checked last to avoid false positives)
 
 _YT = re.compile(
-    r"^[▶►\s]*"                       # optional playing indicator
-    r"(?:\(\d+\)\s*)?"             # optional notification count e.g. "(3) "
-    r"(.+?)"                           # song (and maybe artist)
-    r"(?:\s*[-–]\s*(.+?))?"     # optional " - Artist" portion
-    r"\s*[-–—]\s*YouTube"  # "- YouTube" marker
-    r"(?:\s*[-–—]\s*.+?)?$",  # optional browser suffix: "- Opera", "- Chrome"
+    r"^[▶►\s]*"                       
+    r"(?:\(\d+\)\s*)?"             
+    r"(.+?)"                           
+    r"(?:\s*[-–—]\s*(.+?))?"     
+    r"\s*[-–—]\s*YouTube"
+    r"(?:\s*[-–—]\s*(?:Chrome|Edge|Firefox|Opera|Brave|.*))?$",
     re.IGNORECASE,
 )
 _SC = re.compile(
@@ -118,7 +118,17 @@ def _parse_youtube(title):
     # If we have two parts, part1=song, part2=artist
     # If only one part, the whole thing is the video title (song only)
     return {"source": "YouTube", "song": part1, "artist": part2, "raw": title}
-
+def _parse_youtube_fallback(title):
+    # Remove common suffixes
+    clean = re.sub(r"\s*[-–—]\s*(YouTube|Chrome|Edge|Firefox|Opera|Brave).*?$", "", title, flags=re.IGNORECASE)
+    clean = re.sub(r"^[▶►\s]+", "", clean)
+    clean = re.sub(r"^\(\d+\)\s*", "", clean)
+    
+    if " - " in clean:
+        parts = clean.split(" - ", 1)
+        return {"source": "YouTube", "song": parts[0].strip(), "artist": parts[1].strip() if len(parts) > 1 else "", "raw": title}
+    else:
+        return {"source": "YouTube", "song": clean.strip(), "artist": "", "raw": title}
 
 def _parse_generic(source, m, title):
     if not m:
@@ -186,6 +196,8 @@ def detect_now_playing():
         # YouTube — must be a browser
         if is_browser:
             result = _parse_youtube(title)
+            if not result:
+                result = _parse_youtube_fallback(title)
             if result:
                 return result
 
@@ -580,29 +592,58 @@ class SoniqueApp:
             self.tray.stop()
         os._exit(0)
 
-    # ── Polling ───────────────────────────────────────────────────────────────
+        # ── Polling ───────────────────────────────────────────────────────────────
 
     def _start_polling(self):
+        """Start background thread to detect now playing music."""
         if not HAS_WIN32:
+            print("Warning: pywin32 + psutil not installed. Now Playing detection disabled.")
             return
         self._polling = True
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     def _poll_loop(self):
+        """Background loop that detects currently playing music."""
         while self._polling:
-            np = detect_now_playing()
-            if np and np.get("song") != (self._last_np or {}).get("song"):
-                self._last_np = np
-                if self.tray:
-                    try:
-                        tip = f"{np['song']}"
-                        if np.get("artist"):
-                            tip += f" - {np['artist']}"
-                        self.tray.title = tip
-                    except Exception:
-                        pass
-            time.sleep(4)
+            try:
+                np = detect_now_playing()
 
+                # Determine if the song actually changed
+                song_changed = False
+                if np and self._last_np:
+                    # Compare both song and artist (more reliable)
+                    new_key = (
+                        np.get("song", "").strip().lower(),
+                        np.get("artist", "").strip().lower()
+                    )
+                    old_key = (
+                        self._last_np.get("song", "").strip().lower(),
+                        self._last_np.get("artist", "").strip().lower()
+                    )
+                    song_changed = new_key != old_key
+                elif np and not self._last_np:
+                    song_changed = True  # New song started
+                elif not np and self._last_np:
+                    song_changed = True  # Music stopped
+
+                if song_changed:
+                    self._last_np = np
+                    if self.tray:
+                        try:
+                            if np:
+                                tip = np['song']
+                                if np.get("artist"):
+                                    tip += f" - {np['artist']}"
+                                self.tray.title = tip
+                            else:
+                                self.tray.title = "Sonique — Music AI"
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                print(f"Polling error: {e}")
+
+            time.sleep(3)   # Poll every 3 seconds
     # ── Window ────────────────────────────────────────────────────────────────
 
     def _show_window(self, tab="nowplaying"):
@@ -828,7 +869,7 @@ class SoniqueApp:
 
         def _auto():
             refresh_np()
-            f.after(4000, _auto)
+            f.after(3500, _auto)
         f.after(300, _auto)
 
         def fetch():
