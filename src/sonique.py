@@ -266,18 +266,35 @@ def taste_summary(history):
     ])
 
 
-def _call_ai(prompt, api_key=None, max_tokens=1500):
+def _call_ai(prompt, api_key=""):
+    import ollama
+    
     response = ollama.chat(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
+        format='json'
     )
-    raw = response["message"]["content"]
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines_r = raw.splitlines()
-        lines_r = [l for l in lines_r if not l.startswith("```")]
-        raw = "\n".join(lines_r)
-    return raw.strip()
+    
+    raw_text = response['message']['content'].strip()
+
+    # 1. Extract the clean array using Regex
+    match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+    
+    if match:
+        clean_json_string = match.group(0)
+        try:
+            # 2. CONVERT the string into a Python list!
+            return json.loads(clean_json_string)
+        except json.JSONDecodeError:
+            print("Warning: Regex extracted string, but it still failed to parse.")
+            pass
+            
+    # 3. Fallback: Try to parse the raw text just in case
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        # If it completely fails, return an empty list so the UI doesn't crash
+        return []
 
 
 def get_recommendations(history, mood_filter="", count=5, api_key=None):
@@ -289,13 +306,21 @@ Based on this listener's profile, recommend {count} songs they would love.
 LISTENER PROFILE:
 {profile}{mood_line}
 
-Respond ONLY with a valid JSON array — no markdown, no extra text.
-Each element must have exactly these keys:
-  "song", "artist", "genre", "match" (e.g. "94%"),
-  "why" (2-3 sentences referencing their taste),
-  "tags" (array of 3 short tags)
+CRITICAL INSTRUCTION: You must respond ONLY with a raw, flat JSON array. Do NOT wrap the array in a dictionary or object. Do not use markdown formatting. 
+
+EXAMPLE FORMAT:
+[
+  {{
+    "song": "Example Title",
+    "artist": "Example Artist",
+    "genre": "Pop",
+    "match": "95%",
+    "why": "Because you listen to similar artists.",
+    "tags": ["upbeat", "fun", "dance"]
+  }}
+]
 """
-    return json.loads(_call_ai(prompt, api_key))
+    return _call_ai(prompt, api_key)
 
 
 def get_now_playing_recommendations(now_playing, history, count=5, api_key=None):
@@ -319,7 +344,7 @@ Each element must have exactly these keys:
   "why" (2-3 sentences explaining why it flows well from the current song),
   "tags" (array of 3 short tags)
 """
-    return json.loads(_call_ai(prompt, api_key))
+    return _call_ai(prompt, api_key)
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 
